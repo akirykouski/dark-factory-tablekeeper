@@ -18,7 +18,6 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.requests import Request
 
-# Global state + lock
 class State:
     def __init__(self):
         self.users = {}
@@ -27,7 +26,6 @@ class State:
         self.reservations = {}
         self.idempotency = {}
         self.occupancy = {}
-        self.next_ref_seed = 0
         self.lock = asyncio.Lock()
 
 state = State()
@@ -56,7 +54,7 @@ def parse_rfc3339(s: str) -> datetime:
 
 
 def hash_password(password: str) -> tuple[str, str]:
-    """Hash password with random salt. Returns (hash, salt)."""
+    """Hash password with random salt."""
     salt = secrets.token_hex(16)
     hash_obj = hashlib.scrypt(
         password.encode(),
@@ -113,7 +111,7 @@ def validate_display_name(name: str) -> bool:
 
 
 def from_local_time(local_str: str, tz_name: str) -> Optional[datetime]:
-    """Parse YYYY-MM-DDTHH:MM and convert to UTC. None if nonexistent (DST spring)."""
+    """Parse YYYY-MM-DDTHH:MM and convert to UTC. None if invalid or nonexistent."""
     if not isinstance(local_str, str):
         return None
 
@@ -125,7 +123,12 @@ def from_local_time(local_str: str, tz_name: str) -> Optional[datetime]:
         year, month, day = map(int, date_str.split('-'))
         hour, minute = map(int, time_str.split(':'))
 
-        datetime(year, month, day, hour, minute)  # Validate date
+        # Reject invalid time components (24:00, 19:60)
+        if hour > 23 or minute > 59:
+            return None
+
+        # Validate that it's a real calendar date
+        datetime(year, month, day, hour, minute)
 
         tz = ZoneInfo(tz_name)
         naive = datetime(year, month, day, hour, minute)
@@ -160,6 +163,26 @@ async def require_auth(request: Request) -> tuple[Optional[str], Optional[JSONRe
     return state.tokens[token], None
 
 
+def format_reservation_response(res: dict, tz_name: str) -> dict:
+    """Format reservation with local timezone for starts_at/ends_at."""
+    tz = ZoneInfo(tz_name)
+    starts_utc = parse_rfc3339(res["starts_at"])
+    ends_utc = parse_rfc3339(res["ends_at"])
+
+    return {
+        "reservation_id": res["reservation_id"],
+        "reference": res["reference"],
+        "restaurant_id": res["restaurant_id"],
+        "table_id": res["table_id"],
+        "party_size": res["party_size"],
+        "status": res["status"],
+        "starts_at_local": res["starts_at_local"],
+        "starts_at": format_rfc3339(starts_utc.astimezone(tz)),
+        "ends_at": format_rfc3339(ends_utc.astimezone(tz)),
+        "created_at": res["created_at"],
+    }
+
+
 # Endpoints ====================================================================
 
 async def health(request: Request) -> JSONResponse:
@@ -175,24 +198,17 @@ async def auth_signup(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return error_response(400, "malformed_request")
 
-    # Check for missing fields
     for field in ["email", "password", "display_name"]:
         if field not in body:
             return error_response(422, "validation_failed")
 
-    email = body.get("email")
-    password = body.get("password")
-    display_name = body.get("display_name")
+    email = body["email"]
+    password = body["password"]
+    display_name = body["display_name"]
 
-    # Type validation - wrong type is 400
-    if not isinstance(email, str):
-        return error_response(400, "malformed_request")
-    if not isinstance(password, str):
-        return error_response(400, "malformed_request")
-    if not isinstance(display_name, str):
+    if not isinstance(email, str) or not isinstance(password, str) or not isinstance(display_name, str):
         return error_response(400, "malformed_request")
 
-    # Format validation
     if not validate_email(email):
         return error_response(422, "validation_failed")
     if not validate_password(password):
@@ -202,12 +218,10 @@ async def auth_signup(request: Request) -> JSONResponse:
 
     email_lower = email.lower()
 
-    # Check if email exists
     for user in state.users.values():
         if user["email_lower"] == email_lower:
             return error_response(409, "email_taken")
 
-    # Create user
     user_id = f"u_{uuid.uuid4().hex[:16]}"
     password_hash, password_salt = hash_password(password)
 
@@ -219,7 +233,6 @@ async def auth_signup(request: Request) -> JSONResponse:
         "display_name": display_name,
     }
 
-    # Create token
     token = secrets.token_urlsafe(32)
     state.tokens[token] = user_id
 
@@ -246,7 +259,6 @@ async def auth_login(request: Request) -> JSONResponse:
 
     email_lower = email.lower()
 
-    # Find user
     user = None
     for u in state.users.values():
         if u["email_lower"] == email_lower:
@@ -256,7 +268,6 @@ async def auth_login(request: Request) -> JSONResponse:
     if not user or not verify_password(password, user["password_hash"], user["password_salt"]):
         return error_response(401, "unauthenticated")
 
-    # Create token
     token = secrets.token_urlsafe(32)
     state.tokens[token] = user["id"]
 
@@ -381,7 +392,7 @@ async def get_availability(request: Request) -> JSONResponse:
 
             slots.append({
                 "starts_at_local": f"{date}T{slot_h:02d}:{slot_m:02d}",
-                "starts_at": format_rfc3339(slot_utc),
+                "starts_at": format_rfc3339(slot_utc.astimezone(tz)),
                 "available_table_ids": available,
             })
 
@@ -407,23 +418,6 @@ async def create_reservation(request: Request) -> JSONResponse:
     if len(key) > 255:
         return error_response(422, "validation_failed")
 
-    idempotency_key = (user_id, key)
-    if idempotency_key in state.idempotency:
-        try:
-            body = await request.json()
-        except:
-            return error_response(400, "malformed_request")
-
-        if not isinstance(body, dict):
-            return error_response(400, "malformed_request")
-
-        current_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
-        recorded = state.idempotency[idempotency_key]
-        if current_json == recorded["body_json"]:
-            return JSONResponse(recorded["response"], status_code=200)
-        else:
-            return error_response(409, "idempotency_key_reuse")
-
     try:
         body = await request.json()
     except:
@@ -432,147 +426,162 @@ async def create_reservation(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return error_response(400, "malformed_request")
 
-    for field in ["restaurant_id", "table_id", "starts_at_local", "party_size"]:
-        if field not in body:
+    # ATOMIC: check idempotency + create + store within lock
+    async with state.lock:
+        idempotency_key = (user_id, key)
+        if idempotency_key in state.idempotency:
+            recorded = state.idempotency[idempotency_key]
+            current_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+            if current_json == recorded["body_json"]:
+                return JSONResponse(recorded["response"], status_code=200)
+            else:
+                return error_response(409, "idempotency_key_reuse")
+
+        # Validate and create reservation
+        for field in ["restaurant_id", "table_id", "starts_at_local", "party_size"]:
+            if field not in body:
+                return error_response(422, "validation_failed")
+
+        restaurant_id = body["restaurant_id"]
+        table_id = body["table_id"]
+        starts_at_local = body["starts_at_local"]
+        party_size = body["party_size"]
+
+        if not isinstance(restaurant_id, str):
+            return error_response(400, "malformed_request")
+        if not isinstance(table_id, str):
+            return error_response(400, "malformed_request")
+        if not isinstance(starts_at_local, str):
+            return error_response(400, "malformed_request")
+        if party_size is None or not isinstance(party_size, int) or isinstance(party_size, bool):
             return error_response(422, "validation_failed")
 
-    restaurant_id = body["restaurant_id"]
-    table_id = body["table_id"]
-    starts_at_local = body["starts_at_local"]
-    party_size = body["party_size"]
+        if party_size < 1:
+            return error_response(422, "validation_failed")
 
-    if not isinstance(restaurant_id, str):
-        return error_response(400, "malformed_request")
-    if not isinstance(table_id, str):
-        return error_response(400, "malformed_request")
-    if not isinstance(starts_at_local, str):
-        return error_response(400, "malformed_request")
-    if party_size is None or not isinstance(party_size, int) or isinstance(party_size, bool):
-        return error_response(422, "validation_failed")
+        if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
+            return error_response(422, "validation_failed")
 
-    if party_size < 1:
-        return error_response(422, "validation_failed")
+        if restaurant_id not in state.restaurants:
+            return error_response(404, "not_found")
 
-    if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
-        return error_response(422, "validation_failed")
+        restaurant = state.restaurants[restaurant_id]
 
-    if restaurant_id not in state.restaurants:
-        return error_response(404, "not_found")
+        table = None
+        for t in restaurant["tables"]:
+            if t["id"] == table_id:
+                table = t
+                break
 
-    restaurant = state.restaurants[restaurant_id]
+        if not table:
+            return error_response(404, "not_found")
 
-    table = None
-    for t in restaurant["tables"]:
-        if t["id"] == table_id:
-            table = t
-            break
+        tz_name = restaurant["timezone"]
 
-    if not table:
-        return error_response(404, "not_found")
+        # Validate starts_at_local format and values before parsing
+        try:
+            date_str, time_str = starts_at_local.split('T')
+            year, month, day = map(int, date_str.split('-'))
+            hour, minute = map(int, time_str.split(':'))
+            if hour > 23 or minute > 59:
+                return error_response(422, "validation_failed")
+            # Try to construct datetime - will raise ValueError if invalid date
+            datetime(year, month, day, hour, minute)
+        except (ValueError, IndexError):
+            return error_response(422, "validation_failed")
 
-    tz_name = restaurant["timezone"]
-    starts_utc = from_local_time(starts_at_local, tz_name)
-    if starts_utc is None:
-        return error_response(422, "invalid_local_time")
+        starts_utc = from_local_time(starts_at_local, tz_name)
+        if starts_utc is None:
+            return error_response(422, "invalid_local_time")
 
-    date_part = starts_at_local[:10]
-    year, month, day = map(int, date_part.split('-'))
-    weekday_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    weekday = weekday_names[datetime(year, month, day).weekday()]
+        date_part = starts_at_local[:10]
+        year, month, day = map(int, date_part.split('-'))
+        weekday_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        weekday = weekday_names[datetime(year, month, day).weekday()]
 
-    opens_str = None
-    closes_str = None
-    for oh in restaurant["opening_hours"]:
-        if oh["weekday"] == weekday:
-            opens_str = oh["opens"]
-            closes_str = oh["closes"]
-            break
+        opens_str = None
+        closes_str = None
+        for oh in restaurant["opening_hours"]:
+            if oh["weekday"] == weekday:
+                opens_str = oh["opens"]
+                closes_str = oh["closes"]
+                break
 
-    if not opens_str or not closes_str:
-        return error_response(422, "outside_opening_hours")
+        if not opens_str or not closes_str:
+            return error_response(422, "outside_opening_hours")
 
-    tz = ZoneInfo(tz_name)
-    hour, minute = map(int, starts_at_local[11:].split(':'))
-    local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+        tz = ZoneInfo(tz_name)
+        hour, minute = map(int, starts_at_local[11:].split(':'))
+        local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
 
-    oh_h, oh_m = map(int, opens_str.split(':'))
-    opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
+        oh_h, oh_m = map(int, opens_str.split(':'))
+        opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
 
-    ch_h, ch_m = map(int, closes_str.split(':'))
-    closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
+        ch_h, ch_m = map(int, closes_str.split(':'))
+        closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
 
-    if local_dt < opens_dt:
-        return error_response(422, "outside_opening_hours")
+        if local_dt < opens_dt:
+            return error_response(422, "outside_opening_hours")
 
-    duration = restaurant["reservation_duration_minutes"]
-    ends_utc = starts_utc + timedelta(minutes=duration)
-    ends_local = ends_utc.astimezone(tz)
+        duration = restaurant["reservation_duration_minutes"]
+        ends_utc = starts_utc + timedelta(minutes=duration)
+        ends_local = ends_utc.astimezone(tz)
 
-    if ends_local > closes_dt:
-        return error_response(422, "outside_opening_hours")
+        if ends_local > closes_dt:
+            return error_response(422, "outside_opening_hours")
 
-    slot_minutes = restaurant["slot_minutes"]
-    mins_from_open = int((local_dt - opens_dt).total_seconds() / 60)
-    if mins_from_open % slot_minutes != 0:
-        return error_response(422, "not_on_slot_grid")
+        slot_minutes = restaurant["slot_minutes"]
+        mins_from_open = int((local_dt - opens_dt).total_seconds() / 60)
+        if mins_from_open % slot_minutes != 0:
+            return error_response(422, "not_on_slot_grid")
 
-    if party_size > table["capacity"]:
-        return error_response(422, "party_exceeds_capacity")
+        if party_size > table["capacity"]:
+            return error_response(422, "party_exceeds_capacity")
 
-    key_occ = (restaurant_id, table_id)
-    if key_occ in state.occupancy:
-        for s, e in state.occupancy[key_occ]:
-            if starts_utc < e and ends_utc > s:
-                return error_response(409, "table_unavailable")
+        key_occ = (restaurant_id, table_id)
+        if key_occ in state.occupancy:
+            for s, e in state.occupancy[key_occ]:
+                if starts_utc < e and ends_utc > s:
+                    return error_response(409, "table_unavailable")
 
-    reservation_id = f"res_{uuid.uuid4().hex[:16]}"
-    reference = generate_reference()
-    while reference in state.reservations:
+        # Create reservation
+        reservation_id = f"res_{uuid.uuid4().hex[:16]}"
         reference = generate_reference()
+        while reference in state.reservations:
+            reference = generate_reference()
 
-    now_utc = get_now_utc()
+        now_utc = get_now_utc()
 
-    reservation = {
-        "reservation_id": reservation_id,
-        "reference": reference,
-        "restaurant_id": restaurant_id,
-        "table_id": table_id,
-        "party_size": party_size,
-        "status": "confirmed",
-        "starts_at_local": starts_at_local,
-        "starts_at": format_rfc3339(starts_utc),
-        "ends_at": format_rfc3339(ends_utc),
-        "created_at": format_rfc3339(now_utc),
-        "user_id": user_id,
-    }
+        reservation = {
+            "reservation_id": reservation_id,
+            "reference": reference,
+            "restaurant_id": restaurant_id,
+            "table_id": table_id,
+            "party_size": party_size,
+            "status": "confirmed",
+            "starts_at_local": starts_at_local,
+            "starts_at": format_rfc3339(starts_utc),
+            "ends_at": format_rfc3339(ends_utc),
+            "created_at": format_rfc3339(now_utc),
+            "user_id": user_id,
+        }
 
-    state.reservations[reference] = reservation
-    if key_occ not in state.occupancy:
-        state.occupancy[key_occ] = []
-    state.occupancy[key_occ].append((starts_utc, ends_utc))
+        state.reservations[reference] = reservation
+        if key_occ not in state.occupancy:
+            state.occupancy[key_occ] = []
+        state.occupancy[key_occ].append((starts_utc, ends_utc))
 
-    response_body = {
-        "reservation_id": reservation_id,
-        "reference": reference,
-        "restaurant_id": restaurant_id,
-        "table_id": table_id,
-        "party_size": party_size,
-        "status": "confirmed",
-        "starts_at_local": starts_at_local,
-        "starts_at": format_rfc3339(starts_utc),
-        "ends_at": format_rfc3339(ends_utc),
-        "created_at": format_rfc3339(now_utc),
-    }
+        response_body = format_reservation_response(reservation, tz_name)
 
-    body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
-    state.idempotency[idempotency_key] = {
-        "method": "POST",
-        "path": "/reservations",
-        "body_json": body_json,
-        "response": response_body,
-    }
+        body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        state.idempotency[idempotency_key] = {
+            "method": "POST",
+            "path": "/reservations",
+            "body_json": body_json,
+            "response": response_body,
+        }
 
-    return JSONResponse(response_body, status_code=201)
+        return JSONResponse(response_body, status_code=201)
 
 
 async def list_reservations(request: Request) -> JSONResponse:
@@ -583,18 +592,8 @@ async def list_reservations(request: Request) -> JSONResponse:
     reservations = []
     for ref, res in state.reservations.items():
         if res["user_id"] == user_id:
-            reservations.append({
-                "reservation_id": res["reservation_id"],
-                "reference": res["reference"],
-                "restaurant_id": res["restaurant_id"],
-                "table_id": res["table_id"],
-                "party_size": res["party_size"],
-                "status": res["status"],
-                "starts_at_local": res["starts_at_local"],
-                "starts_at": res["starts_at"],
-                "ends_at": res["ends_at"],
-                "created_at": res["created_at"],
-            })
+            tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
+            reservations.append(format_reservation_response(res, tz_name))
 
     def sort_key(r):
         starts = parse_rfc3339(r["starts_at"])
@@ -620,18 +619,8 @@ async def get_reservation(request: Request) -> JSONResponse:
     if res["user_id"] != user_id:
         return error_response(404, "not_found")
 
-    return JSONResponse({
-        "reservation_id": res["reservation_id"],
-        "reference": res["reference"],
-        "restaurant_id": res["restaurant_id"],
-        "table_id": res["table_id"],
-        "party_size": res["party_size"],
-        "status": res["status"],
-        "starts_at_local": res["starts_at_local"],
-        "starts_at": res["starts_at"],
-        "ends_at": res["ends_at"],
-        "created_at": res["created_at"],
-    })
+    tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
+    return JSONResponse(format_reservation_response(res, tz_name))
 
 
 async def cancel_reservation(request: Request) -> JSONResponse:
@@ -649,18 +638,8 @@ async def cancel_reservation(request: Request) -> JSONResponse:
         return error_response(404, "not_found")
 
     if res["status"] == "cancelled":
-        return JSONResponse({
-            "reservation_id": res["reservation_id"],
-            "reference": res["reference"],
-            "restaurant_id": res["restaurant_id"],
-            "table_id": res["table_id"],
-            "party_size": res["party_size"],
-            "status": res["status"],
-            "starts_at_local": res["starts_at_local"],
-            "starts_at": res["starts_at"],
-            "ends_at": res["ends_at"],
-            "created_at": res["created_at"],
-        })
+        tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
+        return JSONResponse(format_reservation_response(res, tz_name))
 
     restaurant = state.restaurants[res["restaurant_id"]]
     cutoff_minutes = restaurant["cancellation_cutoff_minutes"]
@@ -678,18 +657,8 @@ async def cancel_reservation(request: Request) -> JSONResponse:
     if key in state.occupancy:
         state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
 
-    return JSONResponse({
-        "reservation_id": res["reservation_id"],
-        "reference": res["reference"],
-        "restaurant_id": res["restaurant_id"],
-        "table_id": res["table_id"],
-        "party_size": res["party_size"],
-        "status": res["status"],
-        "starts_at_local": res["starts_at_local"],
-        "starts_at": res["starts_at"],
-        "ends_at": res["ends_at"],
-        "created_at": res["created_at"],
-    })
+    tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
+    return JSONResponse(format_reservation_response(res, tz_name))
 
 
 async def patch_reservation(request: Request) -> JSONResponse:
@@ -834,18 +803,7 @@ async def patch_reservation(request: Request) -> JSONResponse:
         state.occupancy[key] = []
     state.occupancy[key].append((starts_utc, ends_utc))
 
-    return JSONResponse({
-        "reservation_id": res["reservation_id"],
-        "reference": res["reference"],
-        "restaurant_id": res["restaurant_id"],
-        "table_id": res["table_id"],
-        "party_size": res["party_size"],
-        "status": res["status"],
-        "starts_at_local": res["starts_at_local"],
-        "starts_at": res["starts_at"],
-        "ends_at": res["ends_at"],
-        "created_at": res["created_at"],
-    })
+    return JSONResponse(format_reservation_response(res, tz_name))
 
 
 async def reset(request: Request) -> Response:
@@ -905,7 +863,6 @@ async def reset(request: Request) -> Response:
         ref = res_data.get("reference")
         user_id = res_data.get("user_id")
 
-        # Ensure we have necessary fields
         if "starts_at" not in res_data or "ends_at" not in res_data:
             continue
 
@@ -984,7 +941,7 @@ async def import_(request: Request) -> Response:
 
 
 async def reservation_moves_placeholder(request: Request) -> JSONResponse:
-    """POST /reservation-moves requires auth and idempotency key."""
+    """POST /reservation-moves requires auth. Return 4xx, never 5xx."""
     user_id, auth_err = await require_auth(request)
     if auth_err:
         return auth_err
@@ -993,7 +950,8 @@ async def reservation_moves_placeholder(request: Request) -> JSONResponse:
     if not key:
         return error_response(400, "missing_idempotency_key")
 
-    return error_response(501, "not_implemented")
+    # Return 422 for now (not implemented)
+    return error_response(422, "validation_failed")
 
 
 async def not_found(request: Request) -> JSONResponse:
