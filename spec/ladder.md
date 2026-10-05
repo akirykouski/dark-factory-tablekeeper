@@ -10,4 +10,4 @@
 | 3 | S3-T1 explain, history, policies, terms, revisions (S3-01..33, 44) | fixer (drafter c854d6f: declined, no code; fixer d5c50df: 472/472 after 2 test fixes by architect) | 1/1/0 | tests/run.sh 3 -k "not s2_ui and not s3_series_upgrade" |
 | 3 | S3-T2 series + upgrades (S3-34..46) | drafter (9293d40: 457/457 first attempt) | 1/0/0 | tests/run.sh 3 -k "not s2_ui" |
 | 4 | S4-T1 restaurant revision + replans (S4-01..17) | fixer (drafter: 26d8523 453/485 step 1 only; 2b8f1d9 475/485; fixer e108f23: 485/485) | 2/1/0 | TK_NO_PREV=1 tests/run.sh 4 -k "not s2_ui and not test_amend" |
-| 4 | S4-T2 series amend + upgrades (S4-18..25) | in progress: drafter | 0/0/0 | tests/run.sh 4 -k "not s2_ui" |
+| 4 | S4-T2 series amend + upgrades (S4-18..25) | drafter (7e0248b: 516/516 first attempt) | 1/0/0 | tests/run.sh 4 -k "not s2_ui" |
