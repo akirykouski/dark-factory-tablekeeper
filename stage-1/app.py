@@ -920,18 +920,21 @@ async def reset(request: Request) -> Response:
 
 
 async def export(request: Request) -> JSONResponse:
-    export_data = {
-        "track": "tablekeeper",
-        "format_version": 1,
-        "state": {
-            "users": list(state.users.values()),
-            "tokens": state.tokens,
-            "restaurants": list(state.restaurants.values()),
-            "reservations": list(state.reservations.values()),
-            "idempotency": state.idempotency,
-            "occupancy": {str(k): v for k, v in state.occupancy.items()},
+    # Take atomic snapshot under lock
+    async with state.lock:
+        import copy
+        export_data = {
+            "track": "tablekeeper",
+            "format_version": 1,
+            "state": {
+                "users": copy.deepcopy(list(state.users.values())),
+                "tokens": copy.deepcopy(state.tokens),
+                "restaurants": copy.deepcopy(list(state.restaurants.values())),
+                "reservations": copy.deepcopy(list(state.reservations.values())),
+                "idempotency": copy.deepcopy(state.idempotency),
+                "occupancy": copy.deepcopy({str(k): v for k, v in state.occupancy.items()}),
+            }
         }
-    }
     return JSONResponse(export_data)
 
 
