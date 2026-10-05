@@ -68,7 +68,7 @@ def test_overlap_half_open(api, ada):
     assert by["18:30"] == ["t_1", "t_3"]
     assert by["19:00"] == ["t_1", "t_3"]
     assert by["20:00"] == ["t_1", "t_3"]
-    assert by["17:30" if False else "20:30"] == ["t_1", "t_2", "t_3"]  # starts at end
+    assert by["20:30"] == ["t_1", "t_2", "t_3"]  # starts exactly at the end
     # a slot of empty availability still appears
     api.book(ada, table_id="t_1", local=f"{THU}T19:00")
     api.book(ada, table_id="t_3", local=f"{THU}T19:00")
@@ -80,7 +80,7 @@ def test_overlap_half_open(api, ada):
 def test_booking_adjacent_succeeds(api, ada):
     api.book(ada, table_id="t_2", local=f"{THU}T19:00")
     api.book(ada, table_id="t_2", local=f"{THU}T20:30")
-    api.book(ada, table_id="t_2", local=f"{THU}T17:30" if False else f"{THU}T18:00",
+    api.book(ada, table_id="t_2", local=f"{THU}T18:00",
              expect=409)
 
 
