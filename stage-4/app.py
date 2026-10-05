@@ -568,7 +568,8 @@ def build_available_options(restaurant: dict, terms: dict, slot_utc: datetime, s
     options = []
     for table in restaurant["tables"]:
         cap = caps[table["id"]]
-        if cap >= party_size and not is_occupied(rid, table["id"], slot_utc, slot_end_utc):
+        if cap >= party_size and not is_occupied(rid, table["id"], slot_utc, slot_end_utc) \
+                and not is_closed(rid, table["id"], slot_utc, slot_end_utc):
             options.append({"table_ids": [table["id"]], "capacity": cap})
     for pair in restaurant.get("combinable", []):
         t1_id, t2_id = pair
@@ -576,7 +577,9 @@ def build_available_options(restaurant: dict, terms: dict, slot_utc: datetime, s
             continue
         capacity = caps[t1_id] + caps[t2_id]
         if capacity >= party_size and not is_occupied(rid, t1_id, slot_utc, slot_end_utc) \
-                and not is_occupied(rid, t2_id, slot_utc, slot_end_utc):
+                and not is_occupied(rid, t2_id, slot_utc, slot_end_utc) \
+                and not is_closed(rid, t1_id, slot_utc, slot_end_utc) \
+                and not is_closed(rid, t2_id, slot_utc, slot_end_utc):
             options.append({"table_ids": list(pair), "capacity": capacity})
     return options
 
@@ -659,7 +662,7 @@ async def get_availability(request: Request) -> JSONResponse:
                         "policy_version": terms["policy_version"],
                         "available": cap_ok and free,
                         "rules": [{"rule": "capacity", "holds": cap_ok},
-                                  {"rule": "no_overlap", "holds": not occupied}],
+                                  {"rule": "no_overlap", "holds": free}],
                     })
 
             slot = {
@@ -2034,10 +2037,105 @@ async def get_series(request: Request) -> JSONResponse:
         return JSONResponse(response, status_code=200)
 
 
+INSTANT_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})')
+
+
+def parse_instant(v) -> Optional[datetime]:
+    """RFC 3339 instant with an explicit offset; None otherwise."""
+    if not isinstance(v, str) or not INSTANT_RE.fullmatch(v):
+        return None
+    try:
+        dt = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def plan_assignments(restaurant: dict, considered: list, closed_table: str, c_from: datetime, c_to: datetime):
+    """Best seating plan: (chosen {ref: table_ids}, moved_count, unused_seats) or None."""
+    rid = restaurant["id"]
+    options = [[t["id"]] for t in restaurant["tables"]] + [list(p) for p in restaurant.get("combinable", [])]
+    cset = set(considered)
+    fixed = [r for r in state.reservations.values()
+             if r["restaurant_id"] == rid and r["status"] == "confirmed" and r["reference"] not in cset]
+    info = []
+    for ref in considered:
+        res = state.reservations[ref]
+        s, e = parse_rfc3339(res["starts_at"]), parse_rfc3339(res["ends_at"])
+        caps = res["terms"]["capacities"]
+        cands = []
+        for rank, opt in enumerate(options):
+            if closed_table in opt:
+                continue
+            cap = sum(caps.get(t, 0) for t in opt)
+            if cap < res["party_size"]:
+                continue
+            blocked = False
+            for t in opt:
+                if any(s < ce and e > cs for cs, ce in state.closures.get((rid, t), [])):
+                    blocked = True
+                    break
+                if any(t in f["table_ids"] and s < parse_rfc3339(f["ends_at"]) and e > parse_rfc3339(f["starts_at"])
+                       for f in fixed):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            cands.append((rank, opt, cap - res["party_size"], opt != list(res["table_ids"]) and
+                          set(opt) != set(res["table_ids"])))
+        if not cands:
+            return None
+        info.append((ref, s, e, cands))
+
+    best = {"key": None, "choice": None}
+    n = len(info)
+    picked = []
+
+    def dfs(i, moved, unused, ranks):
+        bk = best["key"]
+        if bk is not None:
+            if moved > bk[0] or (moved == bk[0] and unused > bk[1]):
+                return
+        if i == n:
+            key = (moved, unused, tuple(ranks))
+            if bk is None or key < bk:
+                best["key"] = key
+                best["choice"] = list(picked)
+            return
+        ref, s, e, cands = info[i]
+        for rank, opt, extra, mv in cands:
+            clash = False
+            for j in range(i):
+                _r, s2, e2, _c = info[j]
+                if s < e2 and e > s2 and set(picked[j][1]) & set(opt):
+                    clash = True
+                    break
+            if clash:
+                continue
+            picked.append((ref, opt))
+            ranks.append(rank)
+            dfs(i + 1, moved + (1 if mv else 0), unused + extra, ranks)
+            ranks.pop()
+            picked.pop()
+
+    dfs(0, 0, 0, [])
+    if best["key"] is None:
+        return None
+    return {ref: opt for ref, opt in best["choice"]}, best["key"][0], best["key"][1]
+
+
 async def preview_replan(request: Request) -> JSONResponse:
     user_id, auth_err = await require_auth(request)
     if auth_err:
         return auth_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return error_response(400, "malformed_request")
+
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
 
     rid = request.path_params.get("id", "")
     restaurant = state.restaurants.get(rid)
@@ -2051,14 +2149,6 @@ async def preview_replan(request: Request) -> JSONResponse:
         return error_response(400, "missing_idempotency_key")
     if len(key) > 255:
         return error_response(422, "validation_failed")
-
-    try:
-        body = await request.json()
-    except:
-        return error_response(400, "malformed_request")
-
-    if not isinstance(body, dict):
-        return error_response(400, "malformed_request")
 
     async with state.lock:
         path = f"/restaurants/{rid}/replans"
@@ -2080,11 +2170,9 @@ async def preview_replan(request: Request) -> JSONResponse:
         if not isinstance(from_str, str) or not isinstance(to_str, str):
             return error_response(422, "validation_failed")
 
-        # Parse RFC3339 timestamps
-        try:
-            from_utc = parse_rfc3339(from_str)
-            to_utc = parse_rfc3339(to_str)
-        except:
+        from_utc = parse_instant(from_str)
+        to_utc = parse_instant(to_str)
+        if from_utc is None or to_utc is None:
             return error_response(422, "validation_failed")
 
         if from_utc >= to_utc:
@@ -2108,58 +2196,21 @@ async def preview_replan(request: Request) -> JSONResponse:
         if len(restaurant.get("tables", [])) > 6 or len(restaurant.get("combinable", [])) > 4 or len(considered) > 6:
             return error_response(422, "planning_limit")
 
-        # Build table rankings
-        tables = restaurant.get("tables", [])
-        rankings = {}
-        idx = 0
-        for t in tables:
-            rankings[tuple([t["id"]])] = idx
-            idx += 1
-        for pair in restaurant.get("combinable", []):
-            rankings[tuple(sorted(pair))] = idx
-            idx += 1
-
-        # Simple greedy algorithm for now
         considered.sort()
-        assignments = {}
-        for ref in considered:
-            res = state.reservations[ref]
-            current_tables = tuple(sorted(res["table_ids"]))
+        result = plan_assignments(restaurant, considered, table_id, from_utc, to_utc)
+        if result is None:
+            return error_response(409, "no_feasible_plan")
+        chosen, moved_count, unused_seats = result
+        assignments = {ref: (list(chosen[ref]), list(chosen[ref]) != list(state.reservations[ref]["table_ids"]))
+                       for ref in considered}
 
-            # Try to keep current assignment
-            if rankings.get(current_tables, 999) < 999:
-                capacity = sum(t["capacity"] for t in tables if t["id"] in res["table_ids"])
-                if capacity >= res["party_size"]:
-                    assignments[ref] = (current_tables, False)
-                    continue
-
-            # Find best assignment
-            best_option = None
-            best_rank = 999
-            for t in tables:
-                if t["id"] == table_id:
-                    continue
-                key = tuple([t["id"]])
-                if rankings.get(key, 999) < best_rank and t["capacity"] >= res["party_size"]:
-                    best_option = key
-                    best_rank = rankings.get(key, 999)
-
-            if best_option:
-                assignments[ref] = (best_option, True)
-            else:
-                return error_response(409, "no_feasible_plan")
-
-        # Generate plan
         plan_id = f"plan_{uuid.uuid4().hex[:16]}"
-        moved_count = sum(1 for ref in considered if assignments[ref][1])
-        unused_seats = sum(sum(t["capacity"] for t in tables if t["id"] in assignments[ref][0]) - state.reservations[ref]["party_size"] for ref in considered)
-
         plan = {
             "plan_id": plan_id,
             "restaurant_id": rid,
             "revision": state.restaurant_revisions.get(rid, 0),
             "closure": {"table_id": table_id, "from": from_str, "to": to_str},
-            "assignments": [{"reference": ref, "table_ids": list(assignments[ref][0]), "changed": assignments[ref][1]} for ref in considered],
+            "assignments": [{"reference": ref, "table_ids": assignments[ref][0], "changed": assignments[ref][1]} for ref in considered],
             "applied": False,
         }
         state.replans[plan_id] = plan
