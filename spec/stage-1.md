@@ -63,6 +63,13 @@ builders and tests alike.
   timezone, slot_minutes, reservation_duration_minutes, cancellation_cutoff_minutes,
   opening_hours[{weekday,opens,closes}], tables[{id,label,capacity}]), `reservations[]`
   (POST body fields + id, reference, user_id). Missing top-level lists default to `[]`.
+- **S1-19a** Reset validates the whole fixture before replacing anything; an invalid fixture
+  → 422 `validation_failed` and the previous state stays. Invalid includes: a seeded
+  `reference` not matching `^[A-Z0-9]{6,12}$` or duplicated; duplicate user, restaurant,
+  table (within a restaurant) or reservation ids; a reservation naming an unknown user,
+  restaurant or table; an invalid `starts_at_local` or `party_size`; an unknown IANA timezone;
+  `slot_minutes`/`reservation_duration_minutes` < 1; table `capacity` < 1; bad `weekday`/`HH:MM`
+  or `closes` ≤ `opens`; two seeded confirmed reservations overlapping on one table.
 - **S1-20** Seeded users log in immediately with the fixture password.
 - **S1-21** Seeded reservations are confirmed, owned by `user_id`, visible in that user's
   list, occupy their table, keep the given `id` and `reference`. **Decision:** seeded
