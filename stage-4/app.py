@@ -29,6 +29,9 @@ class State:
         self.occupancy = {}
         self.policies = {}
         self.series = {}
+        self.closures = {}  # (rid, table_id) -> [(from_utc, to_utc)]
+        self.replans = {}  # plan_id -> plan object
+        self.restaurant_revisions = {}  # rid -> revision number
         self.lock = asyncio.Lock()
 
 state = State()
@@ -824,6 +827,9 @@ async def create_reservation(request: Request) -> JSONResponse:
         for table_id in table_ids:
             state.occupancy.setdefault((restaurant_id, table_id), []).append((starts_utc, ends_utc))
 
+        # Increment restaurant revision
+        state.restaurant_revisions[restaurant_id] = state.restaurant_revisions.get(restaurant_id, 0) + 1
+
         response_body = format_reservation_response(reservation, restaurant["timezone"])
         state.idempotency[idempotency_key] = {
             "method": "POST",
@@ -1313,8 +1319,12 @@ def build_fixture_state(body: dict) -> Optional[dict]:
                 if s1 < e2 and s2 < e1:
                     return None
 
+    # Initialize restaurant revisions to 0
+    restaurant_revisions = {rid: 0 for rid in new_restaurants.keys()}
+
     return {"users": new_users, "restaurants": new_restaurants,
-            "reservations": new_res, "occupancy": new_occ}
+            "reservations": new_res, "occupancy": new_occ,
+            "restaurant_revisions": restaurant_revisions}
 
 
 async def reset(request: Request) -> Response:
@@ -1338,6 +1348,9 @@ async def reset(request: Request) -> Response:
         state.occupancy = built["occupancy"]
         state.policies = {}
         state.series = {}
+        state.closures = {}
+        state.replans = {}
+        state.restaurant_revisions = built["restaurant_revisions"]
 
     return Response(status_code=204)
 
