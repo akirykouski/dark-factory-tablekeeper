@@ -236,6 +236,13 @@ def is_occupied(rid: str, table_id: str, s: datetime, e: datetime) -> bool:
     return False
 
 
+def is_closed(rid: str, table_id: str, s: datetime, e: datetime) -> bool:
+    for s1, e1 in state.closures.get((rid, table_id), []):
+        if s < e1 and e > s1:
+            return True
+    return False
+
+
 def is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -298,7 +305,7 @@ def terms_of_reservation(res: dict) -> dict:
     return res["terms"]
 
 
-def add_history(res: dict, tz, event: str, changes: list, at: Optional[datetime] = None) -> None:
+def add_history(res: dict, tz, event: str, changes: list, at: Optional[datetime] = None, plan_id: Optional[str] = None) -> None:
     hist = res["history"]
     moment = at or get_now_utc()
     if moment.tzinfo is None:
@@ -308,14 +315,17 @@ def add_history(res: dict, tz, event: str, changes: list, at: Optional[datetime]
         prev = parse_rfc3339(hist[-1]["at"])
         if at_dt < prev:
             at_dt = prev.astimezone(tz)
-    hist.append({
+    entry = {
         "seq": len(hist) + 1,
         "at": format_rfc3339(at_dt),
         "event": event,
         "changes": changes,
         "revision": res["revision"],
         "accepted_terms": copy.deepcopy(res["terms"]),
-    })
+    }
+    if plan_id:
+        entry["plan_id"] = plan_id
+    hist.append(entry)
 
 
 def created_changes(table_ids: list, local: str, party: int) -> list:
@@ -638,7 +648,9 @@ async def get_availability(request: Request) -> JSONResponse:
             explained = []
             for table in restaurant["tables"]:
                 cap_ok = caps[table["id"]] >= party_size_int
-                free = not is_occupied(restaurant_id, table["id"], slot_utc, slot_end_utc)
+                occupied = is_occupied(restaurant_id, table["id"], slot_utc, slot_end_utc)
+                closed = is_closed(restaurant_id, table["id"], slot_utc, slot_end_utc)
+                free = not occupied and not closed
                 if cap_ok and free:
                     available.append(table["id"])
                 if explain:
@@ -647,7 +659,7 @@ async def get_availability(request: Request) -> JSONResponse:
                         "policy_version": terms["policy_version"],
                         "available": cap_ok and free,
                         "rules": [{"rule": "capacity", "holds": cap_ok},
-                                  {"rule": "no_overlap", "holds": free}],
+                                  {"rule": "no_overlap", "holds": not occupied}],
                     })
 
             slot = {
@@ -1989,6 +2001,268 @@ async def get_series(request: Request) -> JSONResponse:
         return JSONResponse(response, status_code=200)
 
 
+async def preview_replan(request: Request) -> JSONResponse:
+    user_id, auth_err = await require_auth(request)
+    if auth_err:
+        return auth_err
+
+    rid = request.path_params.get("id", "")
+    restaurant = state.restaurants.get(rid)
+    if restaurant is None:
+        return error_response(404, "not_found")
+    if user_id not in restaurant.get("manager_user_ids", []):
+        return error_response(403, "forbidden")
+
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return error_response(400, "missing_idempotency_key")
+    if len(key) > 255:
+        return error_response(422, "validation_failed")
+
+    try:
+        body = await request.json()
+    except:
+        return error_response(400, "malformed_request")
+
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
+
+    async with state.lock:
+        path = f"/restaurants/{rid}/replans"
+        idem_key = (user_id, path, key)
+        recorded = state.idempotency.get(idem_key)
+        body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        if recorded is not None:
+            if body_json == recorded["body_json"]:
+                return JSONResponse(recorded["response"], status_code=200)
+            return error_response(409, "idempotency_key_reuse")
+
+        # Validate input
+        table_id = body.get("table_id")
+        from_str = body.get("from")
+        to_str = body.get("to")
+
+        if not isinstance(table_id, str):
+            return error_response(422, "validation_failed")
+        if not isinstance(from_str, str) or not isinstance(to_str, str):
+            return error_response(422, "validation_failed")
+
+        # Parse RFC3339 timestamps
+        try:
+            from_utc = parse_rfc3339(from_str)
+            to_utc = parse_rfc3339(to_str)
+        except:
+            return error_response(422, "validation_failed")
+
+        if from_utc >= to_utc:
+            return error_response(422, "validation_failed")
+
+        # Check if table exists
+        if not any(t["id"] == table_id for t in restaurant.get("tables", [])):
+            return error_response(404, "not_found")
+
+        # Find considered bookings (overlapping the closure)
+        considered = []
+        for ref, res in state.reservations.items():
+            if res["restaurant_id"] != rid or res["status"] != "confirmed":
+                continue
+            res_start = parse_rfc3339(res["starts_at"])
+            res_end = parse_rfc3339(res["ends_at"])
+            if res_start < to_utc and res_end > from_utc:
+                considered.append(ref)
+
+        # Check planning limits
+        if len(restaurant.get("tables", [])) > 6 or len(restaurant.get("combinable", [])) > 4 or len(considered) > 6:
+            return error_response(422, "planning_limit")
+
+        # Build table rankings
+        tables = restaurant.get("tables", [])
+        rankings = {}
+        idx = 0
+        for t in tables:
+            rankings[tuple([t["id"]])] = idx
+            idx += 1
+        for pair in restaurant.get("combinable", []):
+            rankings[tuple(sorted(pair))] = idx
+            idx += 1
+
+        # Simple greedy algorithm for now
+        considered.sort()
+        assignments = {}
+        for ref in considered:
+            res = state.reservations[ref]
+            current_tables = tuple(sorted(res["table_ids"]))
+
+            # Try to keep current assignment
+            if rankings.get(current_tables, 999) < 999:
+                capacity = sum(t["capacity"] for t in tables if t["id"] in res["table_ids"])
+                if capacity >= res["party_size"]:
+                    assignments[ref] = (current_tables, False)
+                    continue
+
+            # Find best assignment
+            best_option = None
+            best_rank = 999
+            for t in tables:
+                if t["id"] == table_id:
+                    continue
+                key = tuple([t["id"]])
+                if rankings.get(key, 999) < best_rank and t["capacity"] >= res["party_size"]:
+                    best_option = key
+                    best_rank = rankings.get(key, 999)
+
+            if best_option:
+                assignments[ref] = (best_option, True)
+            else:
+                return error_response(409, "no_feasible_plan")
+
+        # Generate plan
+        plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+        moved_count = sum(1 for ref in considered if assignments[ref][1])
+        unused_seats = sum(sum(t["capacity"] for t in tables if t["id"] in assignments[ref][0]) - state.reservations[ref]["party_size"] for ref in considered)
+
+        plan = {
+            "plan_id": plan_id,
+            "restaurant_id": rid,
+            "revision": state.restaurant_revisions.get(rid, 0),
+            "closure": {"table_id": table_id, "from": from_str, "to": to_str},
+            "assignments": [{"reference": ref, "table_ids": list(assignments[ref][0]), "changed": assignments[ref][1]} for ref in considered],
+            "applied": False,
+        }
+        state.replans[plan_id] = plan
+
+        response_body = {
+            "plan_id": plan_id,
+            "restaurant_revision": state.restaurant_revisions.get(rid, 0),
+            "closure": plan["closure"],
+            "assignments": plan["assignments"],
+            "moved_count": moved_count,
+            "unused_seats": unused_seats,
+        }
+
+        state.idempotency[idem_key] = {
+            "method": "POST",
+            "path": path,
+            "body_json": body_json,
+            "status": 201,
+            "response": response_body,
+        }
+
+        return JSONResponse(response_body, status_code=201)
+
+
+async def apply_replan(request: Request) -> JSONResponse:
+    user_id, auth_err = await require_auth(request)
+    if auth_err:
+        return auth_err
+
+    rid = request.path_params.get("id", "")
+    plan_id = request.path_params.get("plan_id", "")
+
+    restaurant = state.restaurants.get(rid)
+    if restaurant is None:
+        return error_response(404, "not_found")
+    if user_id not in restaurant.get("manager_user_ids", []):
+        return error_response(403, "forbidden")
+
+    try:
+        body = await request.json()
+    except:
+        return error_response(400, "malformed_request")
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
+
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return error_response(400, "missing_idempotency_key")
+
+    async with state.lock:
+        path = f"/restaurants/{rid}/replans/{plan_id}/apply"
+        idem_key = (user_id, path, key)
+        recorded = state.idempotency.get(idem_key)
+        if recorded is not None:
+            return JSONResponse(recorded["response"], status_code=200)
+
+        if plan_id not in state.replans:
+            return error_response(404, "not_found")
+
+        plan = state.replans[plan_id]
+        if plan["restaurant_id"] != rid:
+            return error_response(404, "not_found")
+        if plan.get("applied"):
+            return error_response(409, "plan_already_applied")
+        if plan["revision"] != state.restaurant_revisions.get(rid, 0):
+            return error_response(409, "stale_plan")
+
+        # Apply the plan
+        tz = ZoneInfo(restaurant["timezone"])
+        closure = plan["closure"]
+        from_utc = parse_rfc3339(closure["from"])
+        to_utc = parse_rfc3339(closure["to"])
+
+        # Record closure
+        state.closures.setdefault((rid, closure["table_id"]), []).append((from_utc, to_utc))
+
+        # Apply assignments
+        reservations = []
+        affected_series = set()
+        for assignment in plan["assignments"]:
+            ref = assignment["reference"]
+            res = state.reservations[ref]
+            if assignment["changed"]:
+                # Remove old occupancy
+                old_start = parse_rfc3339(res["starts_at"])
+                old_end = parse_rfc3339(res["ends_at"])
+                for tid in res["table_ids"]:
+                    key = (rid, tid)
+                    if key in state.occupancy:
+                        state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == old_start and e == old_end)]
+
+                # Update reservation
+                old_table_ids = list(res["table_ids"])
+                res["table_ids"] = assignment["table_ids"]
+                res["revision"] += 1
+                add_history(res, tz, "reassigned", [{"field": "table_ids", "from": old_table_ids, "to": assignment["table_ids"]}], plan_id=plan_id)
+
+                # Add new occupancy
+                for tid in assignment["table_ids"]:
+                    state.occupancy.setdefault((rid, tid), []).append((old_start, old_end))
+
+                # Track series
+                if res.get("series_id"):
+                    affected_series.add(res["series_id"])
+
+            reservations.append(format_reservation_response(res, restaurant["timezone"]))
+
+        # Increment series revisions
+        for series_id in affected_series:
+            series_obj = state.series.get(series_id)
+            if series_obj:
+                series_obj["revision"] += 1
+
+        # Mark plan as applied
+        plan["applied"] = True
+
+        # Increment restaurant revision
+        state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
+
+        response_body = {
+            "plan_id": plan_id,
+            "restaurant_revision": state.restaurant_revisions[rid],
+            "reservations": reservations,
+        }
+
+        state.idempotency[idem_key] = {
+            "method": "POST",
+            "path": path,
+            "body_json": json.dumps(body, sort_keys=True, separators=(',', ':')),
+            "status": 201,
+            "response": response_body,
+        }
+
+        return JSONResponse(response_body, status_code=201)
+
+
 async def not_found(request: Request) -> JSONResponse:
     return error_response(404, "not_found")
 
@@ -2049,6 +2323,8 @@ routes = [
     Route("/reservation-moves", reservation_moves, methods=["POST"]),
     Route("/series", create_series, methods=["POST"]),
     Route("/series/{id}", get_series, methods=["GET"]),
+    Route("/restaurants/{id}/replans", preview_replan, methods=["POST"]),
+    Route("/restaurants/{id}/replans/{plan_id}/apply", apply_replan, methods=["POST"]),
     Route("/static/{path:path}", serve_static, methods=["GET"]),
     Route("/", serve_index, methods=["GET"]),
     Route("/signup", serve_index, methods=["GET"]),
