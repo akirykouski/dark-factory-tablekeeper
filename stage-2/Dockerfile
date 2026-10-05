@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir starlette uvicorn tzdata
 
 # Copy application
 COPY app.py .
+COPY static/ static/
 
 ENV PORT=8080
 

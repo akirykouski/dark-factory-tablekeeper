@@ -1510,6 +1510,40 @@ async def not_found(request: Request) -> JSONResponse:
     return error_response(404, "not_found")
 
 
+async def serve_index(request: Request) -> Response:
+    """Serve index.html for HTML routes."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'static', 'index.html'), 'r') as f:
+            html = f.read()
+        return Response(html, media_type="text/html; charset=utf-8")
+    except:
+        return error_response(404, "not_found")
+
+
+async def serve_static(request: Request) -> Response:
+    """Serve static files (CSS, JS)."""
+    path = request.path_params.get("path", "")
+    file_path = os.path.join(os.path.dirname(__file__), 'static', path)
+
+    if not os.path.isfile(file_path):
+        return error_response(404, "not_found")
+
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+
+        if path.endswith('.css'):
+            media_type = "text/css; charset=utf-8"
+        elif path.endswith('.js'):
+            media_type = "text/javascript; charset=utf-8"
+        else:
+            media_type = "application/octet-stream"
+
+        return Response(content, media_type=media_type)
+    except:
+        return error_response(404, "not_found")
+
+
 routes = [
     Route("/health", health, methods=["GET"]),
     Route("/_test/reset", reset, methods=["POST"]),
@@ -1526,6 +1560,11 @@ routes = [
     Route("/reservations/{reference}/cancel", cancel_reservation, methods=["POST"]),
     Route("/reservations/{reference}", patch_reservation, methods=["PATCH"]),
     Route("/reservation-moves", reservation_moves, methods=["POST"]),
+    Route("/static/{path:path}", serve_static, methods=["GET"]),
+    Route("/", serve_index, methods=["GET"]),
+    Route("/signup", serve_index, methods=["GET"]),
+    Route("/login", serve_index, methods=["GET"]),
+    Route("/lookup", serve_index, methods=["GET"]),
     Route("/{path:path}", not_found, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]),
 ]
 
