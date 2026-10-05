@@ -2347,6 +2347,204 @@ async def apply_replan(request: Request) -> JSONResponse:
         return JSONResponse(response_body, status_code=201)
 
 
+async def amend_series(request: Request) -> JSONResponse:
+    user_id, auth_err = await require_auth(request)
+    if auth_err:
+        return auth_err
+
+    series_id = request.path_params.get("id", "")
+
+    try:
+        body = await request.json()
+    except:
+        return error_response(400, "malformed_request")
+
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
+
+    async with state.lock:
+        if series_id not in state.series:
+            return error_response(404, "not_found")
+
+        series_obj = state.series[series_id]
+        if series_obj["owner"] != user_id:
+            return error_response(404, "not_found")
+
+        key = request.headers.get("idempotency-key", "")
+        if not key:
+            return error_response(400, "missing_idempotency_key")
+        if len(key) > 255:
+            return error_response(422, "validation_failed")
+
+        path = f"/series/{series_id}/amend"
+        idem_key = (user_id, path, key)
+        recorded = state.idempotency.get(idem_key)
+        body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        if recorded is not None:
+            if body_json == recorded["body_json"]:
+                return JSONResponse(recorded["response"], status_code=200)
+            return error_response(409, "idempotency_key_reuse")
+
+        # Validate input fields
+        expected_revision = body.get("expected_revision")
+        from_index = body.get("from_index")
+        local_time = body.get("local_time")
+
+        if not is_int(expected_revision) or expected_revision < 1:
+            return error_response(422, "validation_failed")
+
+        count = len(series_obj["members"])
+        if not is_int(from_index) or from_index < 0 or from_index >= count:
+            return error_response(422, "validation_failed")
+
+        if not isinstance(local_time, str) or not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', local_time):
+            return error_response(422, "validation_failed")
+
+        # Check stale_revision
+        if expected_revision != series_obj["revision"]:
+            return error_response(409, "stale_revision")
+
+        # Find eligible occurrences
+        anchor_ref = series_obj["members"][0]["reference"]
+        anchor = state.reservations[anchor_ref]
+        anchor_date = anchor["starts_at_local"][:10]
+        anchor_year, anchor_month, anchor_day = int(anchor_date[:4]), int(anchor_date[5:7]), int(anchor_date[8:10])
+        interval_weeks = series_obj["interval_weeks"]
+
+        restaurant = state.restaurants[anchor["restaurant_id"]]
+        tz = ZoneInfo(restaurant["timezone"])
+
+        changes_to_apply = []
+        for member in series_obj["members"]:
+            index = member["index"]
+            if index < from_index:
+                continue
+
+            ref = member["reference"]
+            res = state.reservations[ref]
+
+            if res["status"] != "confirmed" or member["exception"]:
+                continue
+
+            # Calculate new date
+            occ_date = datetime(anchor_year, anchor_month, anchor_day) + timedelta(days=index * interval_weeks * 7)
+            occ_year, occ_month, occ_day = occ_date.year, occ_date.month, occ_date.day
+            new_local_str = f"{occ_year:04d}-{occ_month:02d}-{occ_day:02d}T{local_time}"
+
+            # Skip if identical
+            if res["starts_at_local"] == new_local_str:
+                continue
+
+            # Validate cutoff
+            now_utc = get_now_utc()
+            current_start = parse_rfc3339(res["starts_at"])
+            cutoff_minutes = res["terms"]["cancellation_cutoff_minutes"]
+            cutoff_time = current_start - timedelta(minutes=cutoff_minutes)
+            if now_utc > cutoff_time:
+                return error_response(409, "cutoff_passed")
+
+            # Evaluate new time
+            err, new_starts_utc, new_ends_utc, new_terms = evaluate(restaurant, res["table_ids"], new_local_str, res["party_size"])
+            if err:
+                return err
+
+            changes_to_apply.append({
+                "index": index,
+                "ref": ref,
+                "res": res,
+                "new_local": new_local_str,
+                "new_starts": new_starts_utc,
+                "new_ends": new_ends_utc,
+                "new_terms": new_terms,
+                "old_local": res["starts_at_local"],
+            })
+
+        # Check occupancy for all changes
+        if changes_to_apply:
+            for change in changes_to_apply:
+                res = change["res"]
+                for table_id in res["table_ids"]:
+                    # Check against other bookings
+                    for other_ref, other_res in state.reservations.items():
+                        if other_res["status"] != "confirmed" or other_ref == change["ref"]:
+                            continue
+                        # Skip other series members being changed
+                        if any(c["ref"] == other_ref for c in changes_to_apply):
+                            continue
+                        other_start = parse_rfc3339(other_res["starts_at"])
+                        other_end = parse_rfc3339(other_res["ends_at"])
+                        if change["new_starts"] < other_end and change["new_ends"] > other_start:
+                            if table_id in other_res["table_ids"]:
+                                return error_response(409, "table_unavailable")
+
+                    # Check against closures
+                    if is_closed(restaurant["id"], table_id, change["new_starts"], change["new_ends"]):
+                        return error_response(409, "table_unavailable")
+
+        # Apply changes
+        if changes_to_apply:
+            for change in changes_to_apply:
+                res = change["res"]
+                old_local = res["starts_at_local"]
+
+                # Update occupancy
+                old_start = parse_rfc3339(res["starts_at"])
+                old_end = parse_rfc3339(res["ends_at"])
+                for table_id in res["table_ids"]:
+                    key = (res["restaurant_id"], table_id)
+                    if key in state.occupancy:
+                        state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == old_start and e == old_end)]
+
+                # Update reservation
+                res["starts_at_local"] = change["new_local"]
+                res["starts_at"] = format_rfc3339(change["new_starts"])
+                res["ends_at"] = format_rfc3339(change["new_ends"])
+                res["terms"] = change["new_terms"]
+                res["revision"] += 1
+
+                # Add history
+                add_history(res, tz, "changed", [{"field": "starts_at_local", "from": old_local, "to": change["new_local"]}])
+
+                # Update new occupancy
+                for table_id in res["table_ids"]:
+                    state.occupancy.setdefault((res["restaurant_id"], table_id), []).append((change["new_starts"], change["new_ends"]))
+
+            # Increment revisions
+            series_obj["revision"] += 1
+            rid = anchor["restaurant_id"]
+            state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
+
+        # Build response
+        occurrences = []
+        for member in series_obj["members"]:
+            ref = member["reference"]
+            res = state.reservations[ref]
+            occ_data = {
+                "index": member["index"],
+                "reference": ref,
+                "exception": member["exception"],
+                "reservation": format_reservation_response(res, restaurant["timezone"]),
+            }
+            occurrences.append(occ_data)
+
+        response_body = {
+            "series_id": series_id,
+            "revision": series_obj["revision"],
+            "interval_weeks": series_obj["interval_weeks"],
+            "occurrences": occurrences,
+        }
+
+        state.idempotency[idem_key] = {
+            "method": "POST",
+            "path": path,
+            "body_json": body_json,
+            "status": 201,
+            "response": response_body,
+        }
+
+        return JSONResponse(response_body, status_code=201)
+
+
 async def not_found(request: Request) -> JSONResponse:
     return error_response(404, "not_found")
 
@@ -2407,6 +2605,7 @@ routes = [
     Route("/reservation-moves", reservation_moves, methods=["POST"]),
     Route("/series", create_series, methods=["POST"]),
     Route("/series/{id}", get_series, methods=["GET"]),
+    Route("/series/{id}/amend", amend_series, methods=["POST"]),
     Route("/restaurants/{id}/replans", preview_replan, methods=["POST"]),
     Route("/restaurants/{id}/replans/{plan_id}/apply", apply_replan, methods=["POST"]),
     Route("/static/{path:path}", serve_static, methods=["GET"]),
