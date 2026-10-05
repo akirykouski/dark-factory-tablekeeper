@@ -3,7 +3,7 @@ import uuid
 
 import pytest
 
-from conftest import PASSWORD, Api, assert_error, base_fixture, fresh_fixture
+from conftest import DETAIL_KEYS, PASSWORD, Api, assert_error, base_fixture, fresh_fixture
 
 TYPES = {"string": "x", "number": 1, "boolean": True, "null": None, "array": [], "object": {}}
 
@@ -70,11 +70,10 @@ def test_restaurant_detail_shape(api):
     assert r.status_code == 200
     body = r.json()
     fx = base_fixture()["restaurants"][0]
-    assert set(body) == {"id", "name", "timezone", "slot_minutes",
-                         "reservation_duration_minutes", "cancellation_cutoff_minutes",
-                         "opening_hours", "tables"}
-    for k in body:
-        assert body[k] == fx[k], k
+    assert set(body) == DETAIL_KEYS
+    for k in fx:
+        if k in body:
+            assert body[k] == fx[k], k
 
 
 def test_restaurant_detail_unknown_and_overlong(api):

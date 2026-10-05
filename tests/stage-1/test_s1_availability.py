@@ -1,7 +1,7 @@
 """S1-44..S1-49, S1-63..S1-66: availability, occupancy and DST."""
 import pytest
 
-from conftest import FRI, SAT, THU, THU_WINTER, TS_RE, assert_error, fresh_fixture
+from conftest import SLOT_KEYS, FRI, SAT, THU, THU_WINTER, TS_RE, assert_error, fresh_fixture
 
 
 def times(body):
@@ -19,7 +19,7 @@ def test_shape_and_grid(api):
     assert times(body) == ["18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00",
                            "21:30"]
     for s in body["slots"]:
-        assert set(s) == {"starts_at_local", "starts_at", "available_table_ids"}
+        assert set(s) == SLOT_KEYS
         assert TS_RE.match(s["starts_at"])
         assert s["starts_at"] == s["starts_at_local"] + ":00+02:00"
         assert s["available_table_ids"] == ["t_1", "t_2", "t_3"]

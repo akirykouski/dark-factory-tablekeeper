@@ -16,6 +16,28 @@ import pytest
 
 BASE_URL = os.environ.get("TK_BASE_URL", "http://127.0.0.1:8080")
 
+# Stage of the service under test (set by tests/run.sh). Later stages add response fields;
+# shape checks accept exactly the fields of the stage under test.
+STAGE = int(os.environ.get("TK_STAGE", "1"))
+
+RES_KEYS = {"reservation_id", "reference", "restaurant_id", "table_id", "party_size", "status",
+            "starts_at_local", "starts_at", "ends_at", "created_at"}
+if STAGE >= 2:
+    RES_KEYS = RES_KEYS | {"table_ids"}
+if STAGE >= 3:
+    RES_KEYS = RES_KEYS | {"revision", "accepted_terms"}
+
+SLOT_KEYS = {"starts_at_local", "starts_at", "available_table_ids"}
+if STAGE >= 2:
+    SLOT_KEYS = SLOT_KEYS | {"available_options"}
+
+DETAIL_KEYS = {"id", "name", "timezone", "slot_minutes", "reservation_duration_minutes",
+               "cancellation_cutoff_minutes", "opening_hours", "tables"}
+if STAGE >= 2:
+    DETAIL_KEYS = DETAIL_KEYS | {"combinable"}
+if STAGE >= 3:
+    DETAIL_KEYS = DETAIL_KEYS | {"manager_user_ids"}
+
 TS_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$")
 REF_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 

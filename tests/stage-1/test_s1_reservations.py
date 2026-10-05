@@ -3,12 +3,10 @@ import uuid
 
 import pytest
 
-from conftest import (FRI, PAST_THU, REF_RE, SAT, THU, TS_RE, assert_error, base_fixture,
+from conftest import (RES_KEYS, FRI, PAST_THU, REF_RE, SAT, THU, TS_RE, assert_error, base_fixture,
                       fresh_fixture)
 
 TYPES = {"string": "x", "number": 1, "boolean": True, "null": None, "array": [], "object": {}}
-RES_KEYS = {"reservation_id", "reference", "restaurant_id", "table_id", "party_size", "status",
-            "starts_at_local", "starts_at", "ends_at", "created_at"}
 
 
 def body(**kw):
