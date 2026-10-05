@@ -7,3 +7,4 @@
 | 1 | S1-T3 fixture validation, PORT, cleanup (S1-02, S1-19a) — from final review + official check 117/120 | drafter (85db7d6: 314/314 first attempt) | 1/0/0 | tests/run.sh 1 |
 | 2 | S2-T1 combined tables API + upgrade (S2-01..25) | drafter (afff38f: 344/344 first attempt) | 1/0/0 | tests/run.sh 2 -k "not s2_ui" |
 | 2 | S2-T2 browser UI (S2-26..48) | fixer (drafter: ed7af1a 370/390, 3a046fe 357/391, no room report; fixer fc53a34 rewrite: 391/391) | 2/1/0 | tests/run.sh 2 |
+| 3 | S3-T1 explain, history, policies, terms, revisions (S3-01..33, 44) | in progress: drafter | 0/0/0 | tests/run.sh 3 -k "not s2_ui and not s3_series_upgrade" |
