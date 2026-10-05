@@ -1,4 +1,4 @@
-"""Tablekeeper Stage 1: Reservations API."""
+"""Tablekeeper reservations API."""
 from __future__ import annotations
 
 import asyncio
