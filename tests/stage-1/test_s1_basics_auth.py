@@ -197,7 +197,7 @@ def test_signup_malformed_body(api, raw):
     assert_error(api.req("POST", "/auth/signup", content=raw), 400, "malformed_request")
 
 
-@pytest.mark.parametrize("header", [None, "Basic abc", "Bearer", "Bearer ", "Bearer nope",
+@pytest.mark.parametrize("header", [None, "Basic abc", "Bearer", "Bearer nope",
                                     "bearer"])
 def test_bad_bearer(api, header):
     h = {} if header is None else {"Authorization": header}

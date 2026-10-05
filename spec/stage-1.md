@@ -25,7 +25,9 @@ builders and tests alike.
 - **S1-07** Responses are `application/json; charset=utf-8` (except 204). AC: header check.
 - **S1-08** Response timestamps are RFC 3339 with explicit numeric offset, second precision
   (`2026-09-24T19:00:00+02:00`; `created_at` uses `+00:00`). **Decision:** never `Z`, never
-  fractional seconds. AC: regex `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$`.
+  fractional seconds. `starts_at` and `ends_at` carry the **restaurant's local offset** for that
+  instant (the specification's examples and §9 "its local `ends_at` will read 02:00");
+  `created_at` is UTC. AC: regex `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$`.
 - **S1-09** Unknown body fields and unknown query parameters are ignored. AC: extra fields
   do not change the outcome.
 - **S1-10** IDs are opaque strings of at most 64 characters, including fixture IDs.
