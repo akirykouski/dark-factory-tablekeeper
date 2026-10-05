@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ class State:
         self.reservations = {}
         self.idempotency = {}
         self.occupancy = {}
+        self.policies = {}
         self.lock = asyncio.Lock()
 
 state = State()
@@ -174,17 +176,251 @@ def format_reservation_response(res: dict, tz_name: str) -> dict:
         "reservation_id": res["reservation_id"],
         "reference": res["reference"],
         "restaurant_id": res["restaurant_id"],
-        "table_ids": table_ids,
+        "table_ids": list(table_ids),
         "party_size": res["party_size"],
         "status": res["status"],
         "starts_at_local": res["starts_at_local"],
         "starts_at": format_rfc3339(starts_utc.astimezone(tz)),
         "ends_at": format_rfc3339(ends_utc.astimezone(tz)),
         "created_at": res["created_at"],
+        "revision": res["revision"],
+        "accepted_terms": copy.deepcopy(res["terms"]),
     }
     if len(table_ids) == 1:
         resp["table_id"] = table_ids[0]
     return resp
+
+
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+TERM_FIELDS = ("slot_minutes", "reservation_duration_minutes", "cancellation_cutoff_minutes",
+               "opening_hours", "capacities")
+DATE_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
+LOCAL_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}')
+
+
+def policy0_terms(r: dict) -> dict:
+    return {
+        "policy_version": 0,
+        "slot_minutes": r["slot_minutes"],
+        "reservation_duration_minutes": r["reservation_duration_minutes"],
+        "cancellation_cutoff_minutes": r.get("cancellation_cutoff_minutes", 0),
+        "opening_hours": copy.deepcopy(r["opening_hours"]),
+        "capacities": {t["id"]: t["capacity"] for t in r["tables"]},
+    }
+
+
+def select_terms(restaurant: dict, date: str) -> dict:
+    """Terms of the policy applying to a local date (policy 0 when none is effective)."""
+    best = None
+    for p in state.policies.get(restaurant["id"], []):
+        if p["effective_from"] <= date and (
+                best is None or (p["effective_from"], p["policy_version"])
+                > (best["effective_from"], best["policy_version"])):
+            best = p
+    if best is None:
+        return policy0_terms(restaurant)
+    terms = {"policy_version": best["policy_version"]}
+    for k in TERM_FIELDS:
+        terms[k] = copy.deepcopy(best[k])
+    return terms
+
+
+def is_occupied(rid: str, table_id: str, s: datetime, e: datetime) -> bool:
+    for s1, e1 in state.occupancy.get((rid, table_id), []):
+        if s < e1 and e > s1:
+            return True
+    return False
+
+
+def is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def valid_hhmm(v) -> Optional[int]:
+    if not isinstance(v, str) or not re.fullmatch(r'[0-9]{2}:[0-9]{2}', v):
+        return None
+    h, m = int(v[:2]), int(v[3:])
+    if h > 23 or m > 59:
+        return None
+    return h * 60 + m
+
+
+def valid_date(v) -> bool:
+    if not isinstance(v, str) or not DATE_RE.fullmatch(v):
+        return False
+    try:
+        datetime(int(v[:4]), int(v[5:7]), int(v[8:]))
+    except ValueError:
+        return False
+    return True
+
+
+def validate_policy(body: dict, restaurant: dict) -> Optional[dict]:
+    """Complete-policy validation. Returns the normalized policy (without version) or None."""
+    if not valid_date(body.get("effective_from")):
+        return None
+    out = {"effective_from": body["effective_from"]}
+    for f, lo, hi in (("slot_minutes", 1, 1440), ("reservation_duration_minutes", 1, 1440),
+                      ("cancellation_cutoff_minutes", 0, 10080)):
+        v = body.get(f)
+        if not is_int(v) or v < lo or v > hi:
+            return None
+        out[f] = v
+    oh = body.get("opening_hours")
+    if not isinstance(oh, list):
+        return None
+    hours, seen = [], set()
+    for e in oh:
+        if not isinstance(e, dict) or e.get("weekday") not in WEEKDAYS or e["weekday"] in seen:
+            return None
+        o, c = valid_hhmm(e.get("opens")), valid_hhmm(e.get("closes"))
+        if o is None or c is None or c <= o:
+            return None
+        seen.add(e["weekday"])
+        hours.append({"weekday": e["weekday"], "opens": e["opens"], "closes": e["closes"]})
+    out["opening_hours"] = hours
+    caps = body.get("capacities")
+    ids = [t["id"] for t in restaurant["tables"]]
+    if not isinstance(caps, dict) or set(caps.keys()) != set(ids):
+        return None
+    for tid in ids:
+        if not is_int(caps[tid]) or caps[tid] < 1 or caps[tid] > 100:
+            return None
+    out["capacities"] = {tid: caps[tid] for tid in ids}
+    return out
+
+
+def terms_of_reservation(res: dict) -> dict:
+    return res["terms"]
+
+
+def add_history(res: dict, tz, event: str, changes: list, at: Optional[datetime] = None) -> None:
+    hist = res["history"]
+    moment = at or get_now_utc()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    at_dt = moment.astimezone(tz).replace(microsecond=0)
+    if hist:
+        prev = parse_rfc3339(hist[-1]["at"])
+        if at_dt < prev:
+            at_dt = prev.astimezone(tz)
+    hist.append({
+        "seq": len(hist) + 1,
+        "at": format_rfc3339(at_dt),
+        "event": event,
+        "changes": changes,
+        "revision": res["revision"],
+        "accepted_terms": copy.deepcopy(res["terms"]),
+    })
+
+
+def created_changes(table_ids: list, local: str, party: int) -> list:
+    if len(table_ids) == 1:
+        first = {"field": "table_id", "from": None, "to": table_ids[0]}
+    else:
+        first = {"field": "table_ids", "from": None, "to": list(table_ids)}
+    return [first,
+            {"field": "starts_at_local", "from": None, "to": local},
+            {"field": "party_size", "from": None, "to": party}]
+
+
+def diff_changes(old: tuple, new: tuple) -> list:
+    ot, ol, op = old
+    nt, nl, np_ = new
+    ch = []
+    if list(ot) != list(nt):
+        if len(ot) == 1 and len(nt) == 1:
+            ch.append({"field": "table_id", "from": ot[0], "to": nt[0]})
+        else:
+            ch.append({"field": "table_ids", "from": list(ot), "to": list(nt)})
+    if ol != nl:
+        ch.append({"field": "starts_at_local", "from": ol, "to": nl})
+    if op != np_:
+        ch.append({"field": "party_size", "from": op, "to": np_})
+    return ch
+
+
+def init_synthesized(rec: dict, restaurant: dict) -> None:
+    """Give a bare reservation policy-0 terms, revision and a synthesized history."""
+    tz = ZoneInfo(restaurant["timezone"])
+    rec["terms"] = policy0_terms(restaurant)
+    rec["revision"] = 1
+    rec["history"] = []
+    created = parse_rfc3339(rec["created_at"])
+    add_history(rec, tz, "created",
+                created_changes(rec["table_ids"], rec["starts_at_local"], rec["party_size"]), at=created)
+    if rec["status"] == "cancelled":
+        rec["revision"] = 2
+        add_history(rec, tz, "cancelled", [], at=created)
+
+
+def evaluate(restaurant: dict, table_ids: list, local: str, party: int):
+    """Field and rule validation against the policy of the local start date.
+    Returns (error|None, starts_utc, ends_utc, terms)."""
+    def fail(status, code):
+        return error_response(status, code), None, None, None
+
+    if party < 1 or not LOCAL_RE.fullmatch(local):
+        return fail(422, "validation_failed")
+    try:
+        year, month, day = int(local[:4]), int(local[5:7]), int(local[8:10])
+        hour, minute = int(local[11:13]), int(local[14:16])
+        if hour > 23 or minute > 59:
+            return fail(422, "validation_failed")
+        datetime(year, month, day, hour, minute)
+    except ValueError:
+        return fail(422, "validation_failed")
+
+    for table_id in table_ids:
+        if not any(t["id"] == table_id for t in restaurant["tables"]):
+            return fail(404, "not_found")
+
+    terms = select_terms(restaurant, local[:10])
+    tz = ZoneInfo(restaurant["timezone"])
+    starts_utc = from_local_time(local, restaurant["timezone"])
+    if starts_utc is None:
+        return fail(422, "invalid_local_time")
+
+    oh = next((o for o in terms["opening_hours"]
+               if o["weekday"] == WEEKDAYS[datetime(year, month, day).weekday()]), None)
+    if oh is None:
+        return fail(422, "outside_opening_hours")
+
+    local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+    oh_h, oh_m = map(int, oh["opens"].split(':'))
+    ch_h, ch_m = map(int, oh["closes"].split(':'))
+    opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
+    closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
+    if local_dt < opens_dt:
+        return fail(422, "outside_opening_hours")
+
+    ends_utc = starts_utc + timedelta(minutes=terms["reservation_duration_minutes"])
+    if ends_utc.astimezone(tz) > closes_dt:
+        return fail(422, "outside_opening_hours")
+
+    if int((local_dt - opens_dt).total_seconds() / 60) % terms["slot_minutes"] != 0:
+        return fail(422, "not_on_slot_grid")
+
+    capacity = sum(terms["capacities"].get(t, 0) for t in table_ids)
+    if party > capacity:
+        return fail(422, "party_exceeds_capacity")
+    return None, starts_utc, ends_utc, terms
+
+
+def cutoff_passed(res: dict) -> bool:
+    cutoff = timedelta(minutes=res["terms"]["cancellation_cutoff_minutes"])
+    return get_now_utc() >= parse_rfc3339(res["starts_at"]) - cutoff
+
+
+def owned_reservation(user_id: str, reference: str) -> Optional[dict]:
+    res = state.reservations.get(reference)
+    if res is None or res["user_id"] != user_id:
+        return None
+    return res
+
+
+def valid_expected_revision(v) -> bool:
+    return is_int(v) and v > 0
 
 
 # Endpoints ====================================================================
@@ -306,52 +542,27 @@ async def get_restaurant(request: Request) -> JSONResponse:
     resp = dict(r)
     if "combinable" not in resp:
         resp["combinable"] = []
+    resp.setdefault("manager_user_ids", [])
     return JSONResponse(resp)
 
 
-def build_available_options(restaurant: dict, slot_utc: datetime, slot_end_utc: datetime, party_size: int) -> list:
+def build_available_options(restaurant: dict, terms: dict, slot_utc: datetime, slot_end_utc: datetime, party_size: int) -> list:
     """Build available_options: singles first, then pairs."""
+    rid = restaurant["id"]
+    caps = terms["capacities"]
     options = []
-
-    # Singles first in fixture order
     for table in restaurant["tables"]:
-        if table["capacity"] >= party_size:
-            occupied = False
-            key = (restaurant["id"], table["id"])
-            if key in state.occupancy:
-                for s, e in state.occupancy[key]:
-                    if slot_utc < e and slot_end_utc > s:
-                        occupied = True
-                        break
-            if not occupied:
-                options.append({"table_ids": [table["id"]], "capacity": table["capacity"]})
-
-    # Then pairs in combinable order
+        cap = caps[table["id"]]
+        if cap >= party_size and not is_occupied(rid, table["id"], slot_utc, slot_end_utc):
+            options.append({"table_ids": [table["id"]], "capacity": cap})
     for pair in restaurant.get("combinable", []):
         t1_id, t2_id = pair
-        t1 = next((t for t in restaurant["tables"] if t["id"] == t1_id), None)
-        t2 = next((t for t in restaurant["tables"] if t["id"] == t2_id), None)
-        if not t1 or not t2:
+        if t1_id not in caps or t2_id not in caps:
             continue
-        capacity = t1["capacity"] + t2["capacity"]
-        if capacity >= party_size:
-            occupied1 = False
-            occupied2 = False
-            key1 = (restaurant["id"], t1_id)
-            key2 = (restaurant["id"], t2_id)
-            if key1 in state.occupancy:
-                for s, e in state.occupancy[key1]:
-                    if slot_utc < e and slot_end_utc > s:
-                        occupied1 = True
-                        break
-            if key2 in state.occupancy:
-                for s, e in state.occupancy[key2]:
-                    if slot_utc < e and slot_end_utc > s:
-                        occupied2 = True
-                        break
-            if not occupied1 and not occupied2:
-                options.append({"table_ids": list(pair), "capacity": capacity})
-
+        capacity = caps[t1_id] + caps[t2_id]
+        if capacity >= party_size and not is_occupied(rid, t1_id, slot_utc, slot_end_utc) \
+                and not is_occupied(rid, t2_id, slot_utc, slot_end_utc):
+            options.append({"table_ids": list(pair), "capacity": capacity})
     return options
 
 
@@ -363,45 +574,40 @@ async def get_availability(request: Request) -> JSONResponse:
     if not restaurant_id or not date or not party_size:
         return error_response(422, "validation_failed")
 
-    if not re.fullmatch(r'\d+', party_size):
+    if not re.fullmatch(r'[0-9]+', party_size):
         return error_response(422, "validation_failed")
 
     party_size_int = int(party_size)
     if party_size_int < 1:
         return error_response(422, "validation_failed")
 
-    if not re.fullmatch(r'\d{4}-\d\d-\d\d', date):
+    if not valid_date(date):
         return error_response(422, "validation_failed")
+    year, month, day = map(int, date.split('-'))
 
-    try:
-        year, month, day = map(int, date.split('-'))
-        datetime(year, month, day)
-    except ValueError:
-        return error_response(422, "validation_failed")
+    explain = False
+    if "explain" in request.query_params:
+        if any(v != "true" for v in request.query_params.getlist("explain")):
+            return error_response(422, "validation_failed")
+        explain = True
 
     if restaurant_id not in state.restaurants:
         return error_response(404, "not_found")
 
     restaurant = state.restaurants[restaurant_id]
     tz_name = restaurant["timezone"]
-    slot_minutes = restaurant["slot_minutes"]
-    duration_minutes = restaurant["reservation_duration_minutes"]
+    terms = select_terms(restaurant, date)
+    slot_minutes = terms["slot_minutes"]
+    duration_minutes = terms["reservation_duration_minutes"]
+    caps = terms["capacities"]
 
-    weekday_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    weekday = weekday_names[datetime(year, month, day).weekday()]
-
-    opens_str = None
-    closes_str = None
-    for oh in restaurant["opening_hours"]:
-        if oh["weekday"] == weekday:
-            opens_str = oh["opens"]
-            closes_str = oh["closes"]
-            break
+    weekday = WEEKDAYS[datetime(year, month, day).weekday()]
+    oh = next((o for o in terms["opening_hours"] if o["weekday"] == weekday), None)
 
     slots = []
-    if opens_str and closes_str:
-        oh_h, oh_m = map(int, opens_str.split(':'))
-        ch_h, ch_m = map(int, closes_str.split(':'))
+    if oh:
+        oh_h, oh_m = map(int, oh["opens"].split(':'))
+        ch_h, ch_m = map(int, oh["closes"].split(':'))
 
         tz = ZoneInfo(tz_name)
         current_min = oh_h * 60 + oh_m
@@ -411,47 +617,44 @@ async def get_availability(request: Request) -> JSONResponse:
             slot_h = current_min // 60
             slot_m = current_min % 60
 
-            slot_end_min = current_min + duration_minutes
-            if slot_end_min > closes_total_min:
+            if current_min + duration_minutes > closes_total_min:
                 break
 
-            # Check if time exists
             naive = datetime(year, month, day, slot_h, slot_m)
-            try:
-                test = naive.replace(fold=0, tzinfo=tz)
-                if test.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None) != naive:
-                    current_min += slot_minutes
-                    continue
-            except:
+            test = naive.replace(fold=0, tzinfo=tz)
+            if test.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None) != naive:
                 current_min += slot_minutes
                 continue
 
-            local_slot = naive.replace(tzinfo=tz)
-            slot_utc = local_slot.astimezone(timezone.utc)
+            slot_utc = test.astimezone(timezone.utc)
             slot_end_utc = slot_utc + timedelta(minutes=duration_minutes)
 
             available = []
+            explained = []
             for table in restaurant["tables"]:
-                if table["capacity"] >= party_size_int:
-                    occupied = False
-                    key = (restaurant_id, table["id"])
-                    if key in state.occupancy:
-                        for s, e in state.occupancy[key]:
-                            if slot_utc < e and slot_end_utc > s:
-                                occupied = True
-                                break
+                cap_ok = caps[table["id"]] >= party_size_int
+                free = not is_occupied(restaurant_id, table["id"], slot_utc, slot_end_utc)
+                if cap_ok and free:
+                    available.append(table["id"])
+                if explain:
+                    explained.append({
+                        "table_id": table["id"],
+                        "policy_version": terms["policy_version"],
+                        "available": cap_ok and free,
+                        "rules": [{"rule": "capacity", "holds": cap_ok},
+                                  {"rule": "no_overlap", "holds": free}],
+                    })
 
-                    if not occupied:
-                        available.append(table["id"])
-
-            available_options = build_available_options(restaurant, slot_utc, slot_end_utc, party_size_int)
-
-            slots.append({
+            slot = {
                 "starts_at_local": f"{date}T{slot_h:02d}:{slot_m:02d}",
                 "starts_at": format_rfc3339(slot_utc.astimezone(tz)),
                 "available_table_ids": available,
-                "available_options": available_options,
-            })
+                "available_options": build_available_options(
+                    restaurant, terms, slot_utc, slot_end_utc, party_size_int),
+            }
+            if explain:
+                slot["explain"] = explained
+            slots.append(slot)
 
             current_min += slot_minutes
 
@@ -543,7 +746,6 @@ async def create_reservation(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return error_response(400, "malformed_request")
 
-    # ATOMIC: check idempotency + create + store within lock
     async with state.lock:
         idempotency_key = (user_id, "/reservations", key)
         if idempotency_key in state.idempotency:
@@ -554,7 +756,6 @@ async def create_reservation(request: Request) -> JSONResponse:
             else:
                 return error_response(409, "idempotency_key_reuse")
 
-        # Validate required fields
         if "restaurant_id" not in body or "starts_at_local" not in body or "party_size" not in body:
             return error_response(422, "validation_failed")
 
@@ -566,13 +767,10 @@ async def create_reservation(request: Request) -> JSONResponse:
             return error_response(400, "malformed_request")
         if not isinstance(starts_at_local, str):
             return error_response(400, "malformed_request")
-        if party_size is None or not isinstance(party_size, int) or isinstance(party_size, bool):
+        if not is_int(party_size) or party_size < 1:
             return error_response(422, "validation_failed")
 
-        if party_size < 1:
-            return error_response(422, "validation_failed")
-
-        if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
+        if not LOCAL_RE.fullmatch(starts_at_local):
             return error_response(422, "validation_failed")
 
         if restaurant_id not in state.restaurants:
@@ -580,90 +778,26 @@ async def create_reservation(request: Request) -> JSONResponse:
 
         restaurant = state.restaurants[restaurant_id]
 
-        # Validate table_id or table_ids
         err, table_ids = validate_table_ids(body, restaurant)
         if err:
             status, code = err
             return error_response(status, code)
 
-        tz_name = restaurant["timezone"]
+        err, starts_utc, ends_utc, terms = evaluate(restaurant, table_ids, starts_at_local, party_size)
+        if err:
+            return err
 
-        # Validate starts_at_local format and values before parsing
-        try:
-            date_str, time_str = starts_at_local.split('T')
-            year, month, day = map(int, date_str.split('-'))
-            hour, minute = map(int, time_str.split(':'))
-            if hour > 23 or minute > 59:
-                return error_response(422, "validation_failed")
-            datetime(year, month, day, hour, minute)
-        except (ValueError, IndexError):
-            return error_response(422, "validation_failed")
-
-        starts_utc = from_local_time(starts_at_local, tz_name)
-        if starts_utc is None:
-            return error_response(422, "invalid_local_time")
-
-        date_part = starts_at_local[:10]
-        year, month, day = map(int, date_part.split('-'))
-        weekday_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-        weekday = weekday_names[datetime(year, month, day).weekday()]
-
-        opens_str = None
-        closes_str = None
-        for oh in restaurant["opening_hours"]:
-            if oh["weekday"] == weekday:
-                opens_str = oh["opens"]
-                closes_str = oh["closes"]
-                break
-
-        if not opens_str or not closes_str:
-            return error_response(422, "outside_opening_hours")
-
-        tz = ZoneInfo(tz_name)
-        hour, minute = map(int, starts_at_local[11:].split(':'))
-        local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
-
-        oh_h, oh_m = map(int, opens_str.split(':'))
-        opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
-
-        ch_h, ch_m = map(int, closes_str.split(':'))
-        closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
-
-        if local_dt < opens_dt:
-            return error_response(422, "outside_opening_hours")
-
-        duration = restaurant["reservation_duration_minutes"]
-        ends_utc = starts_utc + timedelta(minutes=duration)
-        ends_local = ends_utc.astimezone(tz)
-
-        if ends_local > closes_dt:
-            return error_response(422, "outside_opening_hours")
-
-        slot_minutes = restaurant["slot_minutes"]
-        mins_from_open = int((local_dt - opens_dt).total_seconds() / 60)
-        if mins_from_open % slot_minutes != 0:
-            return error_response(422, "not_on_slot_grid")
-
-        # Calculate capacity for the set
-        capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
-        if party_size > capacity:
-            return error_response(422, "party_exceeds_capacity")
-
-        # Check occupancy for all tables in the set
         for table_id in table_ids:
-            key_occ = (restaurant_id, table_id)
-            if key_occ in state.occupancy:
-                for s, e in state.occupancy[key_occ]:
-                    if starts_utc < e and ends_utc > s:
-                        return error_response(409, "table_unavailable")
+            if is_occupied(restaurant_id, table_id, starts_utc, ends_utc):
+                return error_response(409, "table_unavailable")
 
-        # Create reservation
         reservation_id = f"res_{uuid.uuid4().hex[:16]}"
         reference = generate_reference()
         while reference in state.reservations:
             reference = generate_reference()
 
         now_utc = get_now_utc()
+        tz = ZoneInfo(restaurant["timezone"])
 
         reservation = {
             "reservation_id": reservation_id,
@@ -677,22 +811,21 @@ async def create_reservation(request: Request) -> JSONResponse:
             "ends_at": format_rfc3339(ends_utc),
             "created_at": format_rfc3339(now_utc),
             "user_id": user_id,
+            "revision": 1,
+            "terms": terms,
+            "history": [],
         }
+        add_history(reservation, tz, "created", created_changes(table_ids, starts_at_local, party_size), at=now_utc)
 
         state.reservations[reference] = reservation
         for table_id in table_ids:
-            key_occ = (restaurant_id, table_id)
-            if key_occ not in state.occupancy:
-                state.occupancy[key_occ] = []
-            state.occupancy[key_occ].append((starts_utc, ends_utc))
+            state.occupancy.setdefault((restaurant_id, table_id), []).append((starts_utc, ends_utc))
 
-        response_body = format_reservation_response(reservation, tz_name)
-
-        body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        response_body = format_reservation_response(reservation, restaurant["timezone"])
         state.idempotency[idempotency_key] = {
             "method": "POST",
             "path": "/reservations",
-            "body_json": body_json,
+            "body_json": json.dumps(body, sort_keys=True, separators=(',', ':')),
             "response": response_body,
         }
 
@@ -743,37 +876,30 @@ async def cancel_reservation(request: Request) -> JSONResponse:
     if auth_err:
         return auth_err
 
-    reference = request.path_params.get("reference", "")
-
-    if reference not in state.reservations:
+    res = owned_reservation(user_id, request.path_params.get("reference", ""))
+    if res is None:
         return error_response(404, "not_found")
-
-    res = state.reservations[reference]
-    if res["user_id"] != user_id:
-        return error_response(404, "not_found")
-
-    if res["status"] == "cancelled":
-        tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
-        return JSONResponse(format_reservation_response(res, tz_name))
 
     restaurant = state.restaurants[res["restaurant_id"]]
-    cutoff_minutes = restaurant["cancellation_cutoff_minutes"]
-    starts_utc = parse_rfc3339(res["starts_at"])
-    now_utc = get_now_utc()
+    tz_name = restaurant["timezone"]
 
-    if now_utc >= starts_utc - timedelta(minutes=cutoff_minutes):
+    if res["status"] == "cancelled":
+        return JSONResponse(format_reservation_response(res, tz_name))
+
+    if cutoff_passed(res):
         return error_response(409, "cutoff_passed")
 
     res["status"] = "cancelled"
+    res["revision"] += 1
+    add_history(res, ZoneInfo(tz_name), "cancelled", [])
 
     starts = parse_rfc3339(res["starts_at"])
     ends = parse_rfc3339(res["ends_at"])
-    for table_id in res.get("table_ids", []):
+    for table_id in res["table_ids"]:
         key = (res["restaurant_id"], table_id)
         if key in state.occupancy:
             state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
 
-    tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
     return JSONResponse(format_reservation_response(res, tz_name))
 
 
@@ -782,148 +908,167 @@ async def patch_reservation(request: Request) -> JSONResponse:
     if auth_err:
         return auth_err
 
-    reference = request.path_params.get("reference", "")
-
-    if reference not in state.reservations:
-        return error_response(404, "not_found")
-
-    res = state.reservations[reference]
-    if res["user_id"] != user_id:
-        return error_response(404, "not_found")
-
     try:
         body = await request.json()
-    except:
+    except Exception:
         return error_response(400, "malformed_request")
-
     if not isinstance(body, dict):
         return error_response(400, "malformed_request")
 
-    if res["status"] == "cancelled":
-        return error_response(409, "reservation_cancelled")
-
-    restaurant_id = res["restaurant_id"]
-    table_ids = res.get("table_ids", [])
-    starts_at_local = res["starts_at_local"]
-    party_size = res["party_size"]
-
-    # Handle table_id/table_ids in PATCH
-    if "table_id" in body or "table_ids" in body:
-        err, new_table_ids = validate_table_ids(body, state.restaurants[restaurant_id])
-        if err:
-            status, code = err
-            return error_response(status, code)
-        table_ids = new_table_ids
-
-    if "starts_at_local" in body:
-        starts_at_local = body["starts_at_local"]
-    if "party_size" in body:
-        party_size = body["party_size"]
-
-    if "starts_at_local" in body and not isinstance(starts_at_local, str):
+    if "table_id" in body and not isinstance(body["table_id"], str):
         return error_response(400, "malformed_request")
-    if "party_size" in body:
-        if party_size is None or not isinstance(party_size, int) or isinstance(party_size, bool):
+    if "table_ids" in body and (not isinstance(body["table_ids"], list)
+                                or not all(isinstance(t, str) for t in body["table_ids"])):
+        return error_response(400, "malformed_request")
+    if "starts_at_local" in body and not isinstance(body["starts_at_local"], str):
+        return error_response(400, "malformed_request")
+
+    async with state.lock:
+        res = owned_reservation(user_id, request.path_params.get("reference", ""))
+        if res is None:
+            return error_response(404, "not_found")
+
+        if "expected_revision" in body:
+            er = body["expected_revision"]
+            if not valid_expected_revision(er):
+                return error_response(422, "validation_failed")
+            if er != res["revision"]:
+                return error_response(409, "stale_revision")
+
+        if res["status"] == "cancelled":
+            return error_response(409, "reservation_cancelled")
+        if cutoff_passed(res):
+            return error_response(409, "cutoff_passed")
+
+        restaurant = state.restaurants[res["restaurant_id"]]
+        tz_name = restaurant["timezone"]
+        party_size = body.get("party_size", res["party_size"])
+        if not is_int(party_size) or party_size < 1:
+            return error_response(422, "validation_failed")
+        starts_at_local = body.get("starts_at_local", res["starts_at_local"])
+        if not LOCAL_RE.fullmatch(starts_at_local):
             return error_response(422, "validation_failed")
 
-    if party_size < 1:
-        return error_response(422, "validation_failed")
+        table_ids = list(res["table_ids"])
+        if "table_id" in body or "table_ids" in body:
+            err, table_ids = validate_table_ids(body, restaurant)
+            if err:
+                return error_response(*err)
 
-    if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
-        return error_response(422, "validation_failed")
+        old = (list(res["table_ids"]), res["starts_at_local"], res["party_size"])
+        new = (table_ids, starts_at_local, party_size)
+        if old == new:
+            return JSONResponse(format_reservation_response(res, tz_name))
 
-    restaurant = state.restaurants[restaurant_id]
-    cutoff_minutes = restaurant["cancellation_cutoff_minutes"]
-    current_starts_utc = parse_rfc3339(res["starts_at"])
-    now_utc = get_now_utc()
+        err, starts_utc, ends_utc, terms = evaluate(restaurant, table_ids, starts_at_local, party_size)
+        if err:
+            return err
 
-    if now_utc >= current_starts_utc - timedelta(minutes=cutoff_minutes):
-        return error_response(409, "cutoff_passed")
-
-    tz_name = restaurant["timezone"]
-    starts_utc = from_local_time(starts_at_local, tz_name)
-    if starts_utc is None:
-        return error_response(422, "invalid_local_time")
-
-    date_part = starts_at_local[:10]
-    year, month, day = map(int, date_part.split('-'))
-    weekday_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    weekday = weekday_names[datetime(year, month, day).weekday()]
-
-    opens_str = None
-    closes_str = None
-    for oh in restaurant["opening_hours"]:
-        if oh["weekday"] == weekday:
-            opens_str = oh["opens"]
-            closes_str = oh["closes"]
-            break
-
-    if not opens_str or not closes_str:
-        return error_response(422, "outside_opening_hours")
-
-    tz = ZoneInfo(tz_name)
-    hour, minute = map(int, starts_at_local[11:].split(':'))
-    local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
-
-    oh_h, oh_m = map(int, opens_str.split(':'))
-    opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
-
-    ch_h, ch_m = map(int, closes_str.split(':'))
-    closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
-
-    if local_dt < opens_dt:
-        return error_response(422, "outside_opening_hours")
-
-    duration = restaurant["reservation_duration_minutes"]
-    ends_utc = starts_utc + timedelta(minutes=duration)
-    ends_local = ends_utc.astimezone(tz)
-
-    if ends_local > closes_dt:
-        return error_response(422, "outside_opening_hours")
-
-    slot_minutes = restaurant["slot_minutes"]
-    mins_from_open = int((local_dt - opens_dt).total_seconds() / 60)
-    if mins_from_open % slot_minutes != 0:
-        return error_response(422, "not_on_slot_grid")
-
-    # Calculate capacity
-    capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
-    if party_size > capacity:
-        return error_response(422, "party_exceeds_capacity")
-
-    old_table_ids = res.get("table_ids", [])
-    old_starts = parse_rfc3339(res["starts_at"])
-    old_ends = parse_rfc3339(res["ends_at"])
-
-    # Check occupancy for new tables (excluding own booking)
-    for table_id in table_ids:
-        key = (restaurant_id, table_id)
-        if key in state.occupancy:
-            for s, e in state.occupancy[key]:
-                if s == old_starts and e == old_ends and table_id in old_table_ids:
+        rid = restaurant["id"]
+        old_starts = parse_rfc3339(res["starts_at"])
+        old_ends = parse_rfc3339(res["ends_at"])
+        for table_id in table_ids:
+            for s, e in state.occupancy.get((rid, table_id), []):
+                if s == old_starts and e == old_ends and table_id in res["table_ids"]:
                     continue
                 if starts_utc < e and ends_utc > s:
                     return error_response(409, "table_unavailable")
 
-    res["table_ids"] = table_ids
-    res["starts_at_local"] = starts_at_local
-    res["starts_at"] = format_rfc3339(starts_utc)
-    res["ends_at"] = format_rfc3339(ends_utc)
-    res["party_size"] = party_size
+        for table_id in res["table_ids"]:
+            key = (rid, table_id)
+            state.occupancy[key] = [(s, e) for s, e in state.occupancy.get(key, [])
+                                    if not (s == old_starts and e == old_ends)]
+        for table_id in table_ids:
+            state.occupancy.setdefault((rid, table_id), []).append((starts_utc, ends_utc))
 
-    # Update occupancy
-    for table_id in old_table_ids:
-        key = (restaurant_id, table_id)
-        if key in state.occupancy:
-            state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == old_starts and e == old_ends)]
+        res["table_ids"] = table_ids
+        res["starts_at_local"] = starts_at_local
+        res["starts_at"] = format_rfc3339(starts_utc)
+        res["ends_at"] = format_rfc3339(ends_utc)
+        res["party_size"] = party_size
+        res["terms"] = terms
+        res["revision"] += 1
+        add_history(res, ZoneInfo(tz_name), "changed", diff_changes(old, new))
 
-    for table_id in table_ids:
-        key = (restaurant_id, table_id)
-        if key not in state.occupancy:
-            state.occupancy[key] = []
-        state.occupancy[key].append((starts_utc, ends_utc))
+        return JSONResponse(format_reservation_response(res, tz_name))
 
-    return JSONResponse(format_reservation_response(res, tz_name))
+
+async def publish_policy(request: Request) -> JSONResponse:
+    user_id, auth_err = await require_auth(request)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return error_response(400, "malformed_request")
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
+
+    rid = request.path_params.get("id", "")
+    restaurant = state.restaurants.get(rid)
+    if restaurant is None:
+        return error_response(404, "not_found")
+    if user_id not in restaurant.get("manager_user_ids", []):
+        return error_response(403, "forbidden")
+
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return error_response(400, "missing_idempotency_key")
+    if len(key) > 255:
+        return error_response(422, "validation_failed")
+
+    async with state.lock:
+        path = f"/restaurants/{rid}/policies"
+        idem_key = (user_id, path, key)
+        recorded = state.idempotency.get(idem_key)
+        body_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        if recorded is not None:
+            if body_json == recorded["body_json"]:
+                return JSONResponse(recorded["response"], status_code=200)
+            return error_response(409, "idempotency_key_reuse")
+
+        policy = validate_policy(body, restaurant)
+        if policy is None:
+            return error_response(422, "validation_failed")
+        lst = state.policies.setdefault(rid, [])
+        policy["policy_version"] = len(lst) + 1
+        lst.append(policy)
+        response_body = copy.deepcopy(policy)
+        state.idempotency[idem_key] = {"method": "POST", "path": path, "body_json": body_json,
+                                       "status": 201, "response": response_body}
+        return JSONResponse(copy.deepcopy(policy), status_code=201)
+
+
+async def list_policies(request: Request) -> JSONResponse:
+    rid = request.path_params.get("id", "")
+    if rid not in state.restaurants:
+        return error_response(404, "not_found")
+    return JSONResponse({"policies": copy.deepcopy(state.policies.get(rid, []))})
+
+
+def visible_reservation(request: Request) -> Optional[dict]:
+    """Reservation for the bearer token's owner; None for everything else (never 401)."""
+    token = get_token_from_header(request)
+    user_id = state.tokens.get(token) if token else None
+    if user_id is None:
+        return None
+    return owned_reservation(user_id, request.path_params.get("reference", ""))
+
+
+async def reservation_history(request: Request) -> JSONResponse:
+    res = visible_reservation(request)
+    if res is None:
+        return error_response(404, "not_found")
+    return JSONResponse({"reference": res["reference"], "entries": copy.deepcopy(res["history"])})
+
+
+async def reservation_decision(request: Request) -> JSONResponse:
+    res = visible_reservation(request)
+    if res is None:
+        return error_response(404, "not_found")
+    return JSONResponse({"reference": res["reference"], "revision": res["revision"],
+                         "accepted_terms": copy.deepcopy(res["terms"])})
 
 
 def _valid_id(v) -> bool:
@@ -1030,6 +1175,11 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             if not found1 or not found2:
                 return None
 
+        mgrs = r.get("manager_user_ids", [])
+        if not isinstance(mgrs, list) or not all(isinstance(m, str) for m in mgrs):
+            return None
+        r.setdefault("manager_user_ids", [])
+
         new_restaurants[rid] = r
 
     new_res = {}
@@ -1100,6 +1250,10 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             created = format_rfc3339(now)
         elif not isinstance(created, str):
             return None
+        try:
+            parse_rfc3339(created)
+        except ValueError:
+            return None
 
         status = rd.get("status", "confirmed")
         if status not in ("confirmed", "cancelled"):
@@ -1118,6 +1272,7 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             "created_at": created,
             "user_id": uid,
         }
+        init_synthesized(new_res[ref], restaurant)
         if status == "confirmed":
             for table_id in table_ids:
                 new_occ.setdefault((rd["restaurant_id"], table_id), []).append((starts_utc, ends_utc))
@@ -1152,6 +1307,7 @@ async def reset(request: Request) -> Response:
         state.reservations = built["reservations"]
         state.idempotency = {}
         state.occupancy = built["occupancy"]
+        state.policies = {}
 
     return Response(status_code=204)
 
@@ -1174,6 +1330,7 @@ async def export(request: Request) -> JSONResponse:
                 "restaurants": list(state.restaurants.values()),
                 "reservations": list(state.reservations.values()),
                 "idempotency": idem,
+                "policies": state.policies,
             },
         }
         export_data = copy.deepcopy(export_data)
@@ -1259,6 +1416,12 @@ def build_import_state(st) -> Optional[dict]:
 
             starts, ends = parse_rfc3339(rd["starts_at"]), parse_rfc3339(rd["ends_at"])
             parse_rfc3339(rd["created_at"])
+            rd.pop("table_id", None)
+            if "history" not in rd or "terms" not in rd or "revision" not in rd:
+                init_synthesized(rd, restaurants[rd["restaurant_id"]])
+            elif not isinstance(rd["history"], list) or not isinstance(rd["terms"], dict) \
+                    or not is_int(rd["revision"]):
+                return None
             reservations[rd["reference"]] = rd
             if rd["status"] == "confirmed":
                 for tid in table_ids:
@@ -1278,12 +1441,32 @@ def build_import_state(st) -> Optional[dict]:
                 return None
             idem[k] = {"method": rec["method"], "path": rec["path"], "body_json": rec["body_json"],
                        "status": rec["status"], "response": rec["response"]}
+        policies = {}
+        raw_pol = st.get("policies", {})
+        if not isinstance(raw_pol, dict):
+            return None
+        for rid, lst in raw_pol.items():
+            if rid not in restaurants or not isinstance(lst, list):
+                return None
+            out = []
+            for i, p in enumerate(lst):
+                if not isinstance(p, dict):
+                    return None
+                norm = validate_policy(p, restaurants[rid])
+                if norm is None or p.get("policy_version") != i + 1:
+                    return None
+                norm["policy_version"] = i + 1
+                out.append(norm)
+            policies[rid] = out
+        for r in restaurants.values():
+            r.setdefault("manager_user_ids", [])
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
     except Exception:
         return None
     return {"users": users, "tokens": dict(st["tokens"]), "restaurants": restaurants,
-            "reservations": reservations, "idempotency": idem, "occupancy": occupancy}
+            "reservations": reservations, "idempotency": idem, "occupancy": occupancy,
+            "policies": policies}
 
 
 async def import_(request: Request) -> Response:
@@ -1313,61 +1496,9 @@ async def import_(request: Request) -> Response:
         state.reservations = built["reservations"]
         state.idempotency = built["idempotency"]
         state.occupancy = built["occupancy"]
+        state.policies = built["policies"]
 
     return Response(status_code=204)
-
-
-WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-
-def validate_amendment(restaurant: dict, table_ids: list, starts_at_local: str, party_size: int):
-    """Amendment checks on resulting values. Returns (error|None, starts_utc, ends_utc)."""
-    if party_size < 1 or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
-        return error_response(422, "validation_failed"), None, None
-    try:
-        year, month, day = map(int, starts_at_local[:10].split('-'))
-        hour, minute = map(int, starts_at_local[11:].split(':'))
-        if hour > 23 or minute > 59:
-            return error_response(422, "validation_failed"), None, None
-        datetime(year, month, day, hour, minute)
-    except ValueError:
-        return error_response(422, "validation_failed"), None, None
-
-    # Validate all tables exist
-    for table_id in table_ids:
-        table = next((t for t in restaurant["tables"] if t["id"] == table_id), None)
-        if table is None:
-            return error_response(404, "not_found"), None, None
-
-    tz = ZoneInfo(restaurant["timezone"])
-    starts_utc = from_local_time(starts_at_local, restaurant["timezone"])
-    if starts_utc is None:
-        return error_response(422, "invalid_local_time"), None, None
-
-    oh = next((o for o in restaurant["opening_hours"]
-               if o["weekday"] == WEEKDAYS[datetime(year, month, day).weekday()]), None)
-    if oh is None:
-        return error_response(422, "outside_opening_hours"), None, None
-
-    local_dt = datetime(year, month, day, hour, minute, tzinfo=tz)
-    oh_h, oh_m = map(int, oh["opens"].split(':'))
-    ch_h, ch_m = map(int, oh["closes"].split(':'))
-    opens_dt = datetime(year, month, day, oh_h, oh_m, tzinfo=tz)
-    closes_dt = datetime(year, month, day, ch_h, ch_m, tzinfo=tz)
-    if local_dt < opens_dt:
-        return error_response(422, "outside_opening_hours"), None, None
-
-    ends_utc = starts_utc + timedelta(minutes=restaurant["reservation_duration_minutes"])
-    if ends_utc.astimezone(tz) > closes_dt:
-        return error_response(422, "outside_opening_hours"), None, None
-
-    if int((local_dt - opens_dt).total_seconds() / 60) % restaurant["slot_minutes"] != 0:
-        return error_response(422, "not_on_slot_grid"), None, None
-
-    capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
-    if party_size > capacity:
-        return error_response(422, "party_exceeds_capacity"), None, None
-    return None, starts_utc, ends_utc
 
 
 async def reservation_moves(request: Request) -> JSONResponse:
@@ -1408,25 +1539,24 @@ async def reservation_moves(request: Request) -> JSONResponse:
             return error_response(422, "validation_failed")
 
         for m in moves:
-            for f in ("starts_at_local",):
-                if f in m and not isinstance(m[f], str):
-                    return error_response(400, "malformed_request")
-            # Handle table_id/table_ids types
+            if "starts_at_local" in m and not isinstance(m["starts_at_local"], str):
+                return error_response(400, "malformed_request")
             if "table_id" in m and not isinstance(m["table_id"], str):
                 return error_response(400, "malformed_request")
-            if "table_ids" in m and not isinstance(m["table_ids"], list):
+            if "table_ids" in m and (not isinstance(m["table_ids"], list)
+                                     or not all(isinstance(t, str) for t in m["table_ids"])):
                 return error_response(400, "malformed_request")
 
         for m in moves:
-            if "party_size" in m:
-                ps = m["party_size"]
-                if isinstance(ps, bool) or not isinstance(ps, int) or ps < 1:
-                    return error_response(422, "validation_failed")
+            if "party_size" in m and (not is_int(m["party_size"]) or m["party_size"] < 1):
+                return error_response(422, "validation_failed")
+            if "expected_revision" in m and not valid_expected_revision(m["expected_revision"]):
+                return error_response(422, "validation_failed")
 
         resv = []
         for ref in refs:
-            r = state.reservations.get(ref)
-            if r is None or r["user_id"] != user_id:
+            r = owned_reservation(user_id, ref)
+            if r is None:
                 return error_response(404, "not_found")
             resv.append(r)
         if len({r["restaurant_id"] for r in resv}) != 1:
@@ -1434,66 +1564,65 @@ async def reservation_moves(request: Request) -> JSONResponse:
 
         restaurant = state.restaurants[resv[0]["restaurant_id"]]
         tz_name = restaurant["timezone"]
-        now_utc = get_now_utc()
-        cutoff = timedelta(minutes=restaurant["cancellation_cutoff_minutes"])
-        results = []
+        rid = restaurant["id"]
+
+        plans = []   # per item: None for a no-op, else (table_ids, local, party, starts, ends, terms)
         for m, r in zip(moves, resv):
+            if "expected_revision" in m and m["expected_revision"] != r["revision"]:
+                return error_response(409, "stale_revision")
             if r["status"] == "cancelled":
                 return error_response(409, "reservation_cancelled")
-            if now_utc >= parse_rfc3339(r["starts_at"]) - cutoff:
+            if cutoff_passed(r):
                 return error_response(409, "cutoff_passed")
 
-            # Handle table_id/table_ids in move
+            table_ids = list(r["table_ids"])
             if "table_id" in m or "table_ids" in m:
-                err, new_table_ids = validate_table_ids(m, restaurant)
+                err, table_ids = validate_table_ids(m, restaurant)
                 if err:
-                    status, code = err
-                    return error_response(status, code)
-                table_ids = new_table_ids
-            else:
-                table_ids = r.get("table_ids", [])
-
+                    return error_response(*err)
             local = m.get("starts_at_local", r["starts_at_local"])
             party = m.get("party_size", r["party_size"])
-            err, starts_utc, ends_utc = validate_amendment(restaurant, table_ids, local, party)
+            if (table_ids, local, party) == (list(r["table_ids"]), r["starts_at_local"], r["party_size"]):
+                plans.append(None)
+                continue
+            err, starts_utc, ends_utc, terms = evaluate(restaurant, table_ids, local, party)
             if err:
                 return err
-            results.append((table_ids, local, party, starts_utc, ends_utc))
+            plans.append((table_ids, local, party, starts_utc, ends_utc, terms))
 
-        rid = restaurant["id"]
-        old = {}
-        for r in resv:
-            for table_id in r.get("table_ids", []):
-                old.setdefault((rid, table_id), []).append(
-                    (parse_rfc3339(r["starts_at"]), parse_rfc3339(r["ends_at"])))
-        remaining = {}
-        for k, lst in state.occupancy.items():
-            lst = list(lst)
-            for iv in old.get(k, []):
+        remaining = {k: list(v) for k, v in state.occupancy.items()}
+        for r, plan in zip(resv, plans):
+            if plan is None:
+                continue
+            iv = (parse_rfc3339(r["starts_at"]), parse_rfc3339(r["ends_at"]))
+            for table_id in r["table_ids"]:
+                lst = remaining.get((rid, table_id), [])
                 if iv in lst:
                     lst.remove(iv)
-            remaining[k] = lst
-        for table_ids, _l, _p, s0, e0 in results:
+        for plan in plans:
+            if plan is None:
+                continue
+            table_ids, _l, _p, s0, e0, _t = plan
             for table_id in table_ids:
                 for s1, e1 in remaining.get((rid, table_id), []):
                     if s0 < e1 and e0 > s1:
                         return error_response(409, "table_unavailable")
                 remaining.setdefault((rid, table_id), []).append((s0, e0))
 
-        # Check no overlap within resulting moves
-        for i, (tids_a, _, _, s0a, e0a) in enumerate(results):
-            for tids_b, _, _, s0b, e0b in results[i + 1:]:
-                for tid_a in tids_a:
-                    for tid_b in tids_b:
-                        if tid_a == tid_b and s0a < e0b and s0b < e0a:
-                            return error_response(409, "table_unavailable")
-
-        for r, (table_ids, local, party, s0, e0) in zip(resv, results):
+        tz = ZoneInfo(tz_name)
+        for r, plan in zip(resv, plans):
+            if plan is None:
+                continue
+            table_ids, local, party, s0, e0, terms = plan
+            old = (list(r["table_ids"]), r["starts_at_local"], r["party_size"])
             r["table_ids"] = table_ids
             r["starts_at_local"] = local
             r["party_size"] = party
             r["starts_at"] = format_rfc3339(s0)
             r["ends_at"] = format_rfc3339(e0)
+            r["terms"] = terms
+            r["revision"] += 1
+            add_history(r, tz, "changed", diff_changes(old, (table_ids, local, party)))
         state.occupancy = remaining
         response_body = {"reservations": [format_reservation_response(r, tz_name) for r in resv]}
         state.idempotency[idem_key] = {
@@ -1558,6 +1687,10 @@ routes = [
     Route("/reservations", list_reservations, methods=["GET"]),
     Route("/reservations/{reference}", get_reservation, methods=["GET"]),
     Route("/reservations/{reference}/cancel", cancel_reservation, methods=["POST"]),
+    Route("/reservations/{reference}/history", reservation_history, methods=["GET"]),
+    Route("/reservations/{reference}/decision", reservation_decision, methods=["GET"]),
+    Route("/restaurants/{id}/policies", publish_policy, methods=["POST"]),
+    Route("/restaurants/{id}/policies", list_policies, methods=["GET"]),
     Route("/reservations/{reference}", patch_reservation, methods=["PATCH"]),
     Route("/reservation-moves", reservation_moves, methods=["POST"]),
     Route("/static/{path:path}", serve_static, methods=["GET"]),
