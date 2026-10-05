@@ -441,7 +441,7 @@ def test_concurrent_same_expected_revision(a3, ada):
 
 def test_pair_history(a3, ada):
     r = a3.post("/reservations", {"restaurant_id": "r_anker", "table_ids": ["t_2", "t_1"],
-                                  "starts_at_local": f"{THU}T19:00", "party_size": 5},
+                                  "starts_at_local": f"{THU}T19:00", "party_size": 4},
                 token=ada, key="ph")
     ref = r.json()["reference"]
     # reversed pair is not a change

@@ -172,7 +172,7 @@ def test_cancel(api, ada):
     c = r.json()
     assert set(c) == RES_KEYS
     assert c["status"] == "cancelled"
-    for k in RES_KEYS - {"status"}:
+    for k in RES_KEYS - {"status", "revision"}:  # stage 3: cancel increments revision
         assert c[k] == a[k], k
     r2 = api.post(f"/reservations/{a['reference']}/cancel", {}, token=ada)
     assert r2.status_code == 200 and r2.json() == c
