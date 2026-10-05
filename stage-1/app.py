@@ -820,17 +820,20 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             return None
 
     new_users = {}
+    seen_user_ids = set()
     for u in users:
-        if not _valid_id(u.get("id")):
+        uid = u.get("id")
+        if not _valid_id(uid) or uid in seen_user_ids:
             return None
+        seen_user_ids.add(uid)
         email, password = u.get("email"), u.get("password")
         if not isinstance(email, str) or not isinstance(password, str):
             return None
         if not isinstance(u.get("display_name"), str):
             return None
         password_hash, password_salt = hash_password(password)
-        new_users[u["id"]] = {
-            "id": u["id"],
+        new_users[uid] = {
+            "id": uid,
             "email_lower": email.lower(),
             "password_hash": password_hash,
             "password_salt": password_salt,
@@ -838,29 +841,84 @@ def build_fixture_state(body: dict) -> Optional[dict]:
         }
 
     new_restaurants = {}
+    seen_rest_ids = set()
     for r in restaurants:
-        if not _valid_id(r.get("id")):
+        rid = r.get("id")
+        if not _valid_id(rid) or rid in seen_rest_ids:
             return None
-        for t in r.get("tables") or []:
-            if not isinstance(t, dict) or not _valid_id(t.get("id")):
+        seen_rest_ids.add(rid)
+
+        # Validate restaurant fields
+        if not isinstance(r.get("timezone"), str):
+            return None
+        try:
+            ZoneInfo(r["timezone"])
+        except (KeyError, ValueError):
+            return None
+
+        slot_m = r.get("slot_minutes")
+        dur_m = r.get("reservation_duration_minutes")
+        if not isinstance(slot_m, int) or slot_m < 1 or not isinstance(dur_m, int) or dur_m < 1:
+            return None
+
+        # Validate opening hours
+        seen_table_ids = set()
+        for oh in r.get("opening_hours", []):
+            if not isinstance(oh, dict):
                 return None
-        new_restaurants[r["id"]] = r
+            wd = oh.get("weekday")
+            if wd not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+                return None
+            opens, closes = oh.get("opens"), oh.get("closes")
+            if not isinstance(opens, str) or not isinstance(closes, str):
+                return None
+            if not re.fullmatch(r'\d\d:\d\d', opens) or not re.fullmatch(r'\d\d:\d\d', closes):
+                return None
+            o_h, o_m = map(int, opens.split(':'))
+            c_h, c_m = map(int, closes.split(':'))
+            if o_h > 23 or o_m > 59 or c_h > 23 or c_m > 59:
+                return None
+            if datetime(2000, 1, 1, o_h, o_m) >= datetime(2000, 1, 1, c_h, c_m):
+                return None
+
+        # Validate tables
+        for t in r.get("tables", []):
+            if not isinstance(t, dict):
+                return None
+            tid = t.get("id")
+            if not _valid_id(tid) or tid in seen_table_ids:
+                return None
+            seen_table_ids.add(tid)
+            cap = t.get("capacity")
+            if not isinstance(cap, int) or cap < 1:
+                return None
+
+        new_restaurants[rid] = r
 
     new_res = {}
     new_occ = {}
+    seen_res_ids = set()
+    seen_refs = set()
     now = get_now_utc()
     for rd in reservations:
         rid, ref, uid = rd.get("id"), rd.get("reference"), rd.get("user_id")
-        if not (_valid_id(rid) and _valid_id(ref) and _valid_id(uid)):
+        if not (_valid_id(rid) and _valid_id(uid)):
             return None
-        if ref in new_res:
+        if not isinstance(ref, str) or not re.fullmatch(r'[A-Z0-9]{6,12}', ref):
+            return None
+        if rid in seen_res_ids or ref in seen_refs:
+            return None
+        seen_res_ids.add(rid)
+        seen_refs.add(ref)
+
+        if uid not in new_users:
             return None
         restaurant = new_restaurants.get(rd.get("restaurant_id"))
         if restaurant is None:
             return None
         table_id = rd.get("table_id")
         if not any(isinstance(t, dict) and t.get("id") == table_id
-                   for t in restaurant.get("tables") or []):
+                   for t in restaurant.get("tables", [])):
             return None
         party = rd.get("party_size")
         if isinstance(party, bool) or not isinstance(party, int) or party < 1:
@@ -891,6 +949,13 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             "user_id": uid,
         }
         new_occ.setdefault((rd["restaurant_id"], table_id), []).append((starts_utc, ends_utc))
+
+    # Check for overlapping reservations
+    for occupancies in new_occ.values():
+        for i, (s1, e1) in enumerate(occupancies):
+            for s2, e2 in occupancies[i+1:]:
+                if s1 < e2 and s2 < e1:
+                    return None
 
     return {"users": new_users, "restaurants": new_restaurants,
             "reservations": new_res, "occupancy": new_occ}
