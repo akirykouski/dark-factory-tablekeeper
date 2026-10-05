@@ -863,11 +863,15 @@ async def reset(request: Request) -> Response:
         ref = res_data.get("reference")
         user_id = res_data.get("user_id")
 
-        if "starts_at" not in res_data or "ends_at" not in res_data:
+        # Seeded reservation must have reference and timestamps
+        if not ref or "starts_at" not in res_data or "ends_at" not in res_data:
             continue
 
+        # Map fixture 'id' to 'reservation_id' if needed
+        reservation_id = res_data.get("reservation_id") or res_data.get("id")
         state.reservations[ref] = {
             **res_data,
+            "reservation_id": reservation_id,
             "status": res_data.get("status", "confirmed"),
             "user_id": user_id,
         }
