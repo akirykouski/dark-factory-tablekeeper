@@ -8,4 +8,4 @@
 | 2 | S2-T1 combined tables API + upgrade (S2-01..25) | drafter (afff38f: 344/344 first attempt) | 1/0/0 | tests/run.sh 2 -k "not s2_ui" |
 | 2 | S2-T2 browser UI (S2-26..48) | fixer (drafter: ed7af1a 370/390, 3a046fe 357/391, no room report; fixer fc53a34 rewrite: 391/391) | 2/1/0 | tests/run.sh 2 |
 | 3 | S3-T1 explain, history, policies, terms, revisions (S3-01..33, 44) | fixer (drafter c854d6f: declined, no code; fixer d5c50df: 472/472 after 2 test fixes by architect) | 1/1/0 | tests/run.sh 3 -k "not s2_ui and not s3_series_upgrade" |
-| 3 | S3-T2 series + upgrades (S3-34..46) | in progress: drafter | 0/0/0 | tests/run.sh 3 -k "not s2_ui" |
+| 3 | S3-T2 series + upgrades (S3-34..46) | drafter (9293d40: 457/457 first attempt) | 1/0/0 | tests/run.sh 3 -k "not s2_ui" |
