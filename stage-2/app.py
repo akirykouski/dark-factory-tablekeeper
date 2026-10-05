@@ -169,11 +169,12 @@ def format_reservation_response(res: dict, tz_name: str) -> dict:
     starts_utc = parse_rfc3339(res["starts_at"])
     ends_utc = parse_rfc3339(res["ends_at"])
 
-    return {
+    table_ids = res.get("table_ids", [res["table_id"]] if "table_id" in res else [])
+    resp = {
         "reservation_id": res["reservation_id"],
         "reference": res["reference"],
         "restaurant_id": res["restaurant_id"],
-        "table_id": res["table_id"],
+        "table_ids": table_ids,
         "party_size": res["party_size"],
         "status": res["status"],
         "starts_at_local": res["starts_at_local"],
@@ -181,6 +182,9 @@ def format_reservation_response(res: dict, tz_name: str) -> dict:
         "ends_at": format_rfc3339(ends_utc.astimezone(tz)),
         "created_at": res["created_at"],
     }
+    if len(table_ids) == 1:
+        resp["table_id"] = table_ids[0]
+    return resp
 
 
 # Endpoints ====================================================================
@@ -298,7 +302,57 @@ async def get_restaurant(request: Request) -> JSONResponse:
     if rid not in state.restaurants:
         return error_response(404, "not_found")
 
-    return JSONResponse(state.restaurants[rid])
+    r = state.restaurants[rid]
+    resp = dict(r)
+    if "combinable" not in resp:
+        resp["combinable"] = []
+    return JSONResponse(resp)
+
+
+def build_available_options(restaurant: dict, slot_utc: datetime, slot_end_utc: datetime, party_size: int) -> list:
+    """Build available_options: singles first, then pairs."""
+    options = []
+
+    # Singles first in fixture order
+    for table in restaurant["tables"]:
+        if table["capacity"] >= party_size:
+            occupied = False
+            key = (restaurant["id"], table["id"])
+            if key in state.occupancy:
+                for s, e in state.occupancy[key]:
+                    if slot_utc < e and slot_end_utc > s:
+                        occupied = True
+                        break
+            if not occupied:
+                options.append({"table_ids": [table["id"]], "capacity": table["capacity"]})
+
+    # Then pairs in combinable order
+    for pair in restaurant.get("combinable", []):
+        t1_id, t2_id = pair
+        t1 = next((t for t in restaurant["tables"] if t["id"] == t1_id), None)
+        t2 = next((t for t in restaurant["tables"] if t["id"] == t2_id), None)
+        if not t1 or not t2:
+            continue
+        capacity = t1["capacity"] + t2["capacity"]
+        if capacity >= party_size:
+            occupied1 = False
+            occupied2 = False
+            key1 = (restaurant["id"], t1_id)
+            key2 = (restaurant["id"], t2_id)
+            if key1 in state.occupancy:
+                for s, e in state.occupancy[key1]:
+                    if slot_utc < e and slot_end_utc > s:
+                        occupied1 = True
+                        break
+            if key2 in state.occupancy:
+                for s, e in state.occupancy[key2]:
+                    if slot_utc < e and slot_end_utc > s:
+                        occupied2 = True
+                        break
+            if not occupied1 and not occupied2:
+                options.append({"table_ids": list(pair), "capacity": capacity})
+
+    return options
 
 
 async def get_availability(request: Request) -> JSONResponse:
@@ -390,10 +444,13 @@ async def get_availability(request: Request) -> JSONResponse:
                     if not occupied:
                         available.append(table["id"])
 
+            available_options = build_available_options(restaurant, slot_utc, slot_end_utc, party_size_int)
+
             slots.append({
                 "starts_at_local": f"{date}T{slot_h:02d}:{slot_m:02d}",
                 "starts_at": format_rfc3339(slot_utc.astimezone(tz)),
                 "available_table_ids": available,
+                "available_options": available_options,
             })
 
             current_min += slot_minutes
@@ -404,6 +461,66 @@ async def get_availability(request: Request) -> JSONResponse:
         "timezone": tz_name,
         "slots": slots,
     })
+
+
+def validate_table_ids(body: dict, restaurant: dict) -> tuple[Optional[tuple[int, str]], Optional[list]]:
+    """Validate table_id or table_ids from request body. Returns ((status, error_code)|None, table_ids|None)."""
+    has_table_id = "table_id" in body
+    has_table_ids = "table_ids" in body
+
+    if has_table_id and has_table_ids:
+        return (422, "validation_failed"), None
+
+    if not has_table_id and not has_table_ids:
+        return (422, "validation_failed"), None
+
+    if has_table_id:
+        table_id = body["table_id"]
+        if not isinstance(table_id, str):
+            return (400, "malformed_request"), None
+        table_ids = [table_id]
+    else:
+        table_ids = body["table_ids"]
+        if not isinstance(table_ids, list):
+            return (400, "malformed_request"), None
+        if len(table_ids) == 0:
+            return (422, "validation_failed"), None
+        for tid in table_ids:
+            if not isinstance(tid, str):
+                return (400, "malformed_request"), None
+
+    # Check for duplicates
+    if len(set(table_ids)) != len(table_ids):
+        return (422, "validation_failed"), None
+
+    # Check size
+    if len(table_ids) > 2:
+        return (422, "combination_not_allowed"), None
+
+    # Check tables exist and are in same restaurant (before pair check)
+    for tid in table_ids:
+        found = False
+        for t in restaurant["tables"]:
+            if t["id"] == tid:
+                found = True
+                break
+        if not found:
+            return (404, "not_found"), None
+
+    # Check pair is declared and normalize to declared order
+    if len(table_ids) == 2:
+        t1, t2 = table_ids
+        combinable = restaurant.get("combinable", [])
+        found_pair = None
+        for pair in combinable:
+            if set(pair) == {t1, t2}:
+                found_pair = pair
+                break
+        if not found_pair:
+            return (422, "combination_not_allowed"), None
+        table_ids = list(found_pair)
+
+    return None, table_ids
 
 
 async def create_reservation(request: Request) -> JSONResponse:
@@ -437,19 +554,15 @@ async def create_reservation(request: Request) -> JSONResponse:
             else:
                 return error_response(409, "idempotency_key_reuse")
 
-        # Validate and create reservation
-        for field in ["restaurant_id", "table_id", "starts_at_local", "party_size"]:
-            if field not in body:
-                return error_response(422, "validation_failed")
+        # Validate required fields
+        if "restaurant_id" not in body or "starts_at_local" not in body or "party_size" not in body:
+            return error_response(422, "validation_failed")
 
         restaurant_id = body["restaurant_id"]
-        table_id = body["table_id"]
         starts_at_local = body["starts_at_local"]
         party_size = body["party_size"]
 
         if not isinstance(restaurant_id, str):
-            return error_response(400, "malformed_request")
-        if not isinstance(table_id, str):
             return error_response(400, "malformed_request")
         if not isinstance(starts_at_local, str):
             return error_response(400, "malformed_request")
@@ -467,14 +580,11 @@ async def create_reservation(request: Request) -> JSONResponse:
 
         restaurant = state.restaurants[restaurant_id]
 
-        table = None
-        for t in restaurant["tables"]:
-            if t["id"] == table_id:
-                table = t
-                break
-
-        if not table:
-            return error_response(404, "not_found")
+        # Validate table_id or table_ids
+        err, table_ids = validate_table_ids(body, restaurant)
+        if err:
+            status, code = err
+            return error_response(status, code)
 
         tz_name = restaurant["timezone"]
 
@@ -485,7 +595,6 @@ async def create_reservation(request: Request) -> JSONResponse:
             hour, minute = map(int, time_str.split(':'))
             if hour > 23 or minute > 59:
                 return error_response(422, "validation_failed")
-            # Try to construct datetime - will raise ValueError if invalid date
             datetime(year, month, day, hour, minute)
         except (ValueError, IndexError):
             return error_response(422, "validation_failed")
@@ -535,14 +644,18 @@ async def create_reservation(request: Request) -> JSONResponse:
         if mins_from_open % slot_minutes != 0:
             return error_response(422, "not_on_slot_grid")
 
-        if party_size > table["capacity"]:
+        # Calculate capacity for the set
+        capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
+        if party_size > capacity:
             return error_response(422, "party_exceeds_capacity")
 
-        key_occ = (restaurant_id, table_id)
-        if key_occ in state.occupancy:
-            for s, e in state.occupancy[key_occ]:
-                if starts_utc < e and ends_utc > s:
-                    return error_response(409, "table_unavailable")
+        # Check occupancy for all tables in the set
+        for table_id in table_ids:
+            key_occ = (restaurant_id, table_id)
+            if key_occ in state.occupancy:
+                for s, e in state.occupancy[key_occ]:
+                    if starts_utc < e and ends_utc > s:
+                        return error_response(409, "table_unavailable")
 
         # Create reservation
         reservation_id = f"res_{uuid.uuid4().hex[:16]}"
@@ -556,7 +669,7 @@ async def create_reservation(request: Request) -> JSONResponse:
             "reservation_id": reservation_id,
             "reference": reference,
             "restaurant_id": restaurant_id,
-            "table_id": table_id,
+            "table_ids": table_ids,
             "party_size": party_size,
             "status": "confirmed",
             "starts_at_local": starts_at_local,
@@ -567,9 +680,11 @@ async def create_reservation(request: Request) -> JSONResponse:
         }
 
         state.reservations[reference] = reservation
-        if key_occ not in state.occupancy:
-            state.occupancy[key_occ] = []
-        state.occupancy[key_occ].append((starts_utc, ends_utc))
+        for table_id in table_ids:
+            key_occ = (restaurant_id, table_id)
+            if key_occ not in state.occupancy:
+                state.occupancy[key_occ] = []
+            state.occupancy[key_occ].append((starts_utc, ends_utc))
 
         response_body = format_reservation_response(reservation, tz_name)
 
@@ -651,11 +766,12 @@ async def cancel_reservation(request: Request) -> JSONResponse:
 
     res["status"] = "cancelled"
 
-    key = (res["restaurant_id"], res["table_id"])
     starts = parse_rfc3339(res["starts_at"])
     ends = parse_rfc3339(res["ends_at"])
-    if key in state.occupancy:
-        state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
+    for table_id in res.get("table_ids", []):
+        key = (res["restaurant_id"], table_id)
+        if key in state.occupancy:
+            state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
 
     tz_name = state.restaurants[res["restaurant_id"]]["timezone"]
     return JSONResponse(format_reservation_response(res, tz_name))
@@ -687,19 +803,23 @@ async def patch_reservation(request: Request) -> JSONResponse:
         return error_response(409, "reservation_cancelled")
 
     restaurant_id = res["restaurant_id"]
-    table_id = res["table_id"]
+    table_ids = res.get("table_ids", [])
     starts_at_local = res["starts_at_local"]
     party_size = res["party_size"]
 
-    if "table_id" in body:
-        table_id = body["table_id"]
+    # Handle table_id/table_ids in PATCH
+    if "table_id" in body or "table_ids" in body:
+        err, new_table_ids = validate_table_ids(body, state.restaurants[restaurant_id])
+        if err:
+            status, code = err
+            return error_response(status, code)
+        table_ids = new_table_ids
+
     if "starts_at_local" in body:
         starts_at_local = body["starts_at_local"]
     if "party_size" in body:
         party_size = body["party_size"]
 
-    if "table_id" in body and not isinstance(table_id, str):
-        return error_response(400, "malformed_request")
     if "starts_at_local" in body and not isinstance(starts_at_local, str):
         return error_response(400, "malformed_request")
     if "party_size" in body:
@@ -719,15 +839,6 @@ async def patch_reservation(request: Request) -> JSONResponse:
 
     if now_utc >= current_starts_utc - timedelta(minutes=cutoff_minutes):
         return error_response(409, "cutoff_passed")
-
-    table = None
-    for t in restaurant["tables"]:
-        if t["id"] == table_id:
-            table = t
-            break
-
-    if not table:
-        return error_response(404, "not_found")
 
     tz_name = restaurant["timezone"]
     starts_utc = from_local_time(starts_at_local, tz_name)
@@ -775,33 +886,42 @@ async def patch_reservation(request: Request) -> JSONResponse:
     if mins_from_open % slot_minutes != 0:
         return error_response(422, "not_on_slot_grid")
 
-    if party_size > table["capacity"]:
+    # Calculate capacity
+    capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
+    if party_size > capacity:
         return error_response(422, "party_exceeds_capacity")
 
-    key = (restaurant_id, table_id)
-    old_key = (res["restaurant_id"], res["table_id"])
+    old_table_ids = res.get("table_ids", [])
     old_starts = parse_rfc3339(res["starts_at"])
     old_ends = parse_rfc3339(res["ends_at"])
 
-    if key in state.occupancy:
-        for s, e in state.occupancy[key]:
-            if s == old_starts and e == old_ends and key == old_key:
-                continue
-            if starts_utc < e and ends_utc > s:
-                return error_response(409, "table_unavailable")
+    # Check occupancy for new tables (excluding own booking)
+    for table_id in table_ids:
+        key = (restaurant_id, table_id)
+        if key in state.occupancy:
+            for s, e in state.occupancy[key]:
+                if s == old_starts and e == old_ends and table_id in old_table_ids:
+                    continue
+                if starts_utc < e and ends_utc > s:
+                    return error_response(409, "table_unavailable")
 
-    res["table_id"] = table_id
+    res["table_ids"] = table_ids
     res["starts_at_local"] = starts_at_local
     res["starts_at"] = format_rfc3339(starts_utc)
     res["ends_at"] = format_rfc3339(ends_utc)
     res["party_size"] = party_size
 
-    if old_key in state.occupancy:
-        state.occupancy[old_key] = [(s, e) for s, e in state.occupancy[old_key] if not (s == old_starts and e == old_ends)]
+    # Update occupancy
+    for table_id in old_table_ids:
+        key = (restaurant_id, table_id)
+        if key in state.occupancy:
+            state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == old_starts and e == old_ends)]
 
-    if key not in state.occupancy:
-        state.occupancy[key] = []
-    state.occupancy[key].append((starts_utc, ends_utc))
+    for table_id in table_ids:
+        key = (restaurant_id, table_id)
+        if key not in state.occupancy:
+            state.occupancy[key] = []
+        state.occupancy[key].append((starts_utc, ends_utc))
 
     return JSONResponse(format_reservation_response(res, tz_name))
 
@@ -893,6 +1013,23 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             if not isinstance(cap, int) or cap < 1:
                 return None
 
+        # Validate combinable pairs
+        combinable = r.get("combinable", [])
+        if not isinstance(combinable, list):
+            return None
+        for pair in combinable:
+            if not isinstance(pair, list) or len(pair) != 2:
+                return None
+            t1, t2 = pair
+            if not isinstance(t1, str) or not isinstance(t2, str):
+                return None
+            if t1 == t2:
+                return None
+            found1 = any(t["id"] == t1 for t in r.get("tables", []))
+            found2 = any(t["id"] == t2 for t in r.get("tables", []))
+            if not found1 or not found2:
+                return None
+
         new_restaurants[rid] = r
 
     new_res = {}
@@ -916,10 +1053,38 @@ def build_fixture_state(body: dict) -> Optional[dict]:
         restaurant = new_restaurants.get(rd.get("restaurant_id"))
         if restaurant is None:
             return None
+
+        # Handle both table_id and table_ids
+        table_ids = rd.get("table_ids")
         table_id = rd.get("table_id")
-        if not any(isinstance(t, dict) and t.get("id") == table_id
-                   for t in restaurant.get("tables", [])):
+        if table_ids is not None:
+            if not isinstance(table_ids, list) or len(table_ids) == 0:
+                return None
+            for tid in table_ids:
+                if not isinstance(tid, str):
+                    return None
+                if not any(t["id"] == tid for t in restaurant["tables"]):
+                    return None
+            # Normalize pair order to declared order
+            if len(table_ids) == 2:
+                t1, t2 = table_ids
+                found_pair = None
+                for pair in restaurant.get("combinable", []):
+                    if set(pair) == {t1, t2}:
+                        found_pair = pair
+                        break
+                if not found_pair:
+                    return None
+                table_ids = list(found_pair)
+        elif table_id is not None:
+            if not isinstance(table_id, str):
+                return None
+            if not any(t["id"] == table_id for t in restaurant["tables"]):
+                return None
+            table_ids = [table_id]
+        else:
             return None
+
         party = rd.get("party_size")
         if isinstance(party, bool) or not isinstance(party, int) or party < 1:
             return None
@@ -935,20 +1100,27 @@ def build_fixture_state(body: dict) -> Optional[dict]:
             created = format_rfc3339(now)
         elif not isinstance(created, str):
             return None
+
+        status = rd.get("status", "confirmed")
+        if status not in ("confirmed", "cancelled"):
+            return None
+
         new_res[ref] = {
             "reservation_id": rid,
             "reference": ref,
             "restaurant_id": rd["restaurant_id"],
-            "table_id": table_id,
+            "table_ids": table_ids,
             "party_size": party,
-            "status": "confirmed",
+            "status": status,
             "starts_at_local": rd["starts_at_local"],
             "starts_at": format_rfc3339(starts_utc),
             "ends_at": format_rfc3339(ends_utc),
             "created_at": created,
             "user_id": uid,
         }
-        new_occ.setdefault((rd["restaurant_id"], table_id), []).append((starts_utc, ends_utc))
+        if status == "confirmed":
+            for table_id in table_ids:
+                new_occ.setdefault((rd["restaurant_id"], table_id), []).append((starts_utc, ends_utc))
 
     # Check for overlapping reservations
     for occupancies in new_occ.values():
@@ -1057,7 +1229,7 @@ def build_import_state(st) -> Optional[dict]:
         for rd in st["reservations"]:
             if not isinstance(rd, dict):
                 return None
-            for f in ("reservation_id", "reference", "restaurant_id", "table_id", "status",
+            for f in ("reservation_id", "reference", "restaurant_id", "status",
                       "starts_at_local", "starts_at", "ends_at", "created_at", "user_id"):
                 if not isinstance(rd.get(f), str):
                     return None
@@ -1067,11 +1239,30 @@ def build_import_state(st) -> Optional[dict]:
                 return None
             if not isinstance(rd.get("party_size"), int) or isinstance(rd["party_size"], bool):
                 return None
+
+            # Handle both table_id (stage-1) and table_ids (stage-2)
+            table_id = rd.get("table_id")
+            table_ids = rd.get("table_ids")
+            if table_ids is not None:
+                if not isinstance(table_ids, list) or len(table_ids) == 0:
+                    return None
+                for tid in table_ids:
+                    if not isinstance(tid, str):
+                        return None
+            elif table_id is not None:
+                if not isinstance(table_id, str):
+                    return None
+                table_ids = [table_id]
+                rd["table_ids"] = table_ids
+            else:
+                return None
+
             starts, ends = parse_rfc3339(rd["starts_at"]), parse_rfc3339(rd["ends_at"])
             parse_rfc3339(rd["created_at"])
             reservations[rd["reference"]] = rd
             if rd["status"] == "confirmed":
-                occupancy.setdefault((rd["restaurant_id"], rd["table_id"]), []).append((starts, ends))
+                for tid in table_ids:
+                    occupancy.setdefault((rd["restaurant_id"], tid), []).append((starts, ends))
 
         idem = {}
         for rec in st["idempotency"]:
@@ -1129,8 +1320,8 @@ async def import_(request: Request) -> Response:
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
-def validate_amendment(restaurant: dict, table_id: str, starts_at_local: str, party_size: int):
-    """Ordinary amendment checks on resulting values. Returns (error|None, starts_utc, ends_utc)."""
+def validate_amendment(restaurant: dict, table_ids: list, starts_at_local: str, party_size: int):
+    """Amendment checks on resulting values. Returns (error|None, starts_utc, ends_utc)."""
     if party_size < 1 or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d', starts_at_local):
         return error_response(422, "validation_failed"), None, None
     try:
@@ -1142,9 +1333,11 @@ def validate_amendment(restaurant: dict, table_id: str, starts_at_local: str, pa
     except ValueError:
         return error_response(422, "validation_failed"), None, None
 
-    table = next((t for t in restaurant["tables"] if t["id"] == table_id), None)
-    if table is None:
-        return error_response(404, "not_found"), None, None
+    # Validate all tables exist
+    for table_id in table_ids:
+        table = next((t for t in restaurant["tables"] if t["id"] == table_id), None)
+        if table is None:
+            return error_response(404, "not_found"), None, None
 
     tz = ZoneInfo(restaurant["timezone"])
     starts_utc = from_local_time(starts_at_local, restaurant["timezone"])
@@ -1171,7 +1364,8 @@ def validate_amendment(restaurant: dict, table_id: str, starts_at_local: str, pa
     if int((local_dt - opens_dt).total_seconds() / 60) % restaurant["slot_minutes"] != 0:
         return error_response(422, "not_on_slot_grid"), None, None
 
-    if party_size > table["capacity"]:
+    capacity = sum(t["capacity"] for t in restaurant["tables"] if t["id"] in table_ids)
+    if party_size > capacity:
         return error_response(422, "party_exceeds_capacity"), None, None
     return None, starts_utc, ends_utc
 
@@ -1214,9 +1408,15 @@ async def reservation_moves(request: Request) -> JSONResponse:
             return error_response(422, "validation_failed")
 
         for m in moves:
-            for f in ("table_id", "starts_at_local"):
+            for f in ("starts_at_local",):
                 if f in m and not isinstance(m[f], str):
                     return error_response(400, "malformed_request")
+            # Handle table_id/table_ids types
+            if "table_id" in m and not isinstance(m["table_id"], str):
+                return error_response(400, "malformed_request")
+            if "table_ids" in m and not isinstance(m["table_ids"], list):
+                return error_response(400, "malformed_request")
+
         for m in moves:
             if "party_size" in m:
                 ps = m["party_size"]
@@ -1242,19 +1442,30 @@ async def reservation_moves(request: Request) -> JSONResponse:
                 return error_response(409, "reservation_cancelled")
             if now_utc >= parse_rfc3339(r["starts_at"]) - cutoff:
                 return error_response(409, "cutoff_passed")
-            table_id = m.get("table_id", r["table_id"])
+
+            # Handle table_id/table_ids in move
+            if "table_id" in m or "table_ids" in m:
+                err, new_table_ids = validate_table_ids(m, restaurant)
+                if err:
+                    status, code = err
+                    return error_response(status, code)
+                table_ids = new_table_ids
+            else:
+                table_ids = r.get("table_ids", [])
+
             local = m.get("starts_at_local", r["starts_at_local"])
             party = m.get("party_size", r["party_size"])
-            err, starts_utc, ends_utc = validate_amendment(restaurant, table_id, local, party)
+            err, starts_utc, ends_utc = validate_amendment(restaurant, table_ids, local, party)
             if err:
                 return err
-            results.append((table_id, local, party, starts_utc, ends_utc))
+            results.append((table_ids, local, party, starts_utc, ends_utc))
 
         rid = restaurant["id"]
         old = {}
         for r in resv:
-            old.setdefault((rid, r["table_id"]), []).append(
-                (parse_rfc3339(r["starts_at"]), parse_rfc3339(r["ends_at"])))
+            for table_id in r.get("table_ids", []):
+                old.setdefault((rid, table_id), []).append(
+                    (parse_rfc3339(r["starts_at"]), parse_rfc3339(r["ends_at"])))
         remaining = {}
         for k, lst in state.occupancy.items():
             lst = list(lst)
@@ -1262,18 +1473,23 @@ async def reservation_moves(request: Request) -> JSONResponse:
                 if iv in lst:
                     lst.remove(iv)
             remaining[k] = lst
-        for table_id, _l, _p, s0, e0 in results:
-            for s1, e1 in remaining.get((rid, table_id), []):
-                if s0 < e1 and e0 > s1:
-                    return error_response(409, "table_unavailable")
-            remaining.setdefault((rid, table_id), []).append((s0, e0))
-        for i, a in enumerate(results):
-            for b in results[i + 1:]:
-                if a[0] == b[0] and a[3] < b[4] and a[4] > b[3]:
-                    return error_response(409, "table_unavailable")
+        for table_ids, _l, _p, s0, e0 in results:
+            for table_id in table_ids:
+                for s1, e1 in remaining.get((rid, table_id), []):
+                    if s0 < e1 and e0 > s1:
+                        return error_response(409, "table_unavailable")
+                remaining.setdefault((rid, table_id), []).append((s0, e0))
 
-        for r, (table_id, local, party, s0, e0) in zip(resv, results):
-            r["table_id"] = table_id
+        # Check no overlap within resulting moves
+        for i, (tids_a, _, _, s0a, e0a) in enumerate(results):
+            for tids_b, _, _, s0b, e0b in results[i + 1:]:
+                for tid_a in tids_a:
+                    for tid_b in tids_b:
+                        if tid_a == tid_b and s0a < e0b and s0b < e0a:
+                            return error_response(409, "table_unavailable")
+
+        for r, (table_ids, local, party, s0, e0) in zip(resv, results):
+            r["table_ids"] = table_ids
             r["starts_at_local"] = local
             r["party_size"] = party
             r["starts_at"] = format_rfc3339(s0)
