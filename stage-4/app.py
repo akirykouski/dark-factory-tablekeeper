@@ -925,6 +925,9 @@ async def cancel_reservation(request: Request) -> JSONResponse:
             if key in state.occupancy:
                 state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
 
+        # Increment restaurant revision for cancellation (not a repeated one)
+        state.restaurant_revisions[res["restaurant_id"]] = state.restaurant_revisions.get(res["restaurant_id"], 0) + 1
+
         return JSONResponse(format_reservation_response(res, tz_name))
 
 
@@ -1025,6 +1028,9 @@ async def patch_reservation(request: Request) -> JSONResponse:
                         break
                 series_obj["revision"] += 1
 
+        # Increment restaurant revision for real amendment
+        state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
+
         return JSONResponse(format_reservation_response(res, tz_name))
 
 
@@ -1072,6 +1078,8 @@ async def publish_policy(request: Request) -> JSONResponse:
         response_body = copy.deepcopy(policy)
         state.idempotency[idem_key] = {"method": "POST", "path": path, "body_json": body_json,
                                        "status": 201, "response": response_body}
+        # Increment restaurant revision for policy publication
+        state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
         return JSONResponse(copy.deepcopy(policy), status_code=201)
 
 
@@ -1715,6 +1723,12 @@ async def reservation_moves(request: Request) -> JSONResponse:
             if series_obj:
                 series_obj["revision"] += 1
         state.occupancy = remaining
+
+        # Increment restaurant revision for moves batch with at least one real change
+        if any(p is not None for p in plans):
+            rid = resv[0]["restaurant_id"]
+            state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
+
         response_body = {"reservations": [format_reservation_response(r, tz_name) for r in resv]}
         state.idempotency[idem_key] = {
             "method": "POST",
@@ -1914,6 +1928,10 @@ async def create_series(request: Request) -> JSONResponse:
             series_obj["members"].append(member)
 
         state.series[series_id] = series_obj
+
+        # Increment restaurant revision for series adoption
+        rid = anchor["restaurant_id"]
+        state.restaurant_revisions[rid] = state.restaurant_revisions.get(rid, 0) + 1
 
         response_body = {
             "series_id": series_id,
