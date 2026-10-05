@@ -1,122 +1,14 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tablekeeper</title>
+  <title>Tablekeeper · Reserve a table</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div id="app">
-    <nav class="navbar">
-      <div class="navbar-brand" onclick="app.router('/')">Tablekeeper</div>
-      <div class="navbar-nav">
-        <a onclick="app.router('/')">Find a table</a>
-        <a onclick="app.router('/lookup')">Find my booking</a>
-      </div>
-      <div class="navbar-user">
-        <span id="current-user" data-testid="current-user" style="display: none;"></span>
-        <button id="logout-button" data-testid="logout-button" class="btn-secondary" style="display: none; margin: 0;">Sign out</button>
-        <div id="auth-nav" style="display: none;">
-          <a onclick="app.router('/login')" style="margin-right: var(--spacing-md);">Sign in</a>
-          <a onclick="app.router('/signup')">Sign up</a>
-        </div>
-      </div>
-    </nav>
-
-    <main id="page-content" class="page">
-      <!-- Home/Search -->
-      <div id="page-home" style="display: none;">
-        <h1>Find a table</h1>
-
-        <div class="search-form">
-          <div class="search-form-row">
-            <div class="form-group">
-              <label for="restaurant-select">Restaurant</label>
-              <select id="restaurant-select" data-testid="restaurant-select"></select>
-            </div>
-            <div class="form-group">
-              <label for="date-input">Date</label>
-              <input type="date" id="date-input" data-testid="date-input">
-            </div>
-            <div class="form-group">
-              <label for="party-size-input">Party size</label>
-              <input type="number" id="party-size-input" data-testid="party-size-input" min="1" value="2">
-            </div>
-            <button class="btn-primary" onclick="app.search()" data-testid="search-button">Search</button>
-          </div>
-        </div>
-
-        <div class="grid-wrapper">
-          <div id="no-slots" data-testid="no-slots" class="no-slots">No availability for this date</div>
-          <div id="availability-grid" data-testid="availability-grid" class="availability-grid"></div>
-        </div>
-
-        <!-- Booking form -->
-        <div id="booking-form-container" data-testid="booking-form" class="booking-form-container"></div>
-      </div>
-
-      <!-- Signup -->
-      <div id="page-signup" style="display: none;">
-        <div class="auth-container">
-          <h1>Sign up</h1>
-
-          <form id="signup-form" onsubmit="app.submitSignup(event)">
-            <div class="form-group">
-              <label for="signup-email">Email</label>
-              <input type="email" id="signup-email" data-testid="signup-email" required>
-            </div>
-            <div class="form-group">
-              <label for="signup-password">Password</label>
-              <input type="password" id="signup-password" data-testid="signup-password" required>
-            </div>
-            <div class="form-group">
-              <label for="signup-display-name">Display name</label>
-              <input type="text" id="signup-display-name" data-testid="signup-display-name" required>
-            </div>
-            <button type="submit" class="btn-primary" data-testid="signup-submit">Create account</button>
-          </form>
-          <p>Already have an account? <a onclick="app.router('/login')">Sign in</a></p>
-        </div>
-      </div>
-
-      <!-- Login -->
-      <div id="page-login" style="display: none;">
-        <div class="auth-container">
-          <h1>Sign in</h1>
-
-          <form id="login-form" onsubmit="app.submitLogin(event)">
-            <div class="form-group">
-              <label for="login-email">Email</label>
-              <input type="email" id="login-email" data-testid="login-email" required>
-            </div>
-            <div class="form-group">
-              <label for="login-password">Password</label>
-              <input type="password" id="login-password" data-testid="login-password" required>
-            </div>
-            <button type="submit" class="btn-primary" data-testid="login-submit">Sign in</button>
-          </form>
-          <p>Don't have an account? <a onclick="app.router('/signup')">Sign up</a></p>
-        </div>
-      </div>
-
-      <!-- Lookup -->
-      <div id="page-lookup" style="display: none;">
-        <h1>Find my booking</h1>
-
-        <div class="lookup-container">
-          <div class="form-group">
-            <label for="lookup-reference-input">Reservation reference</label>
-            <div class="lookup-form">
-              <input type="text" id="lookup-reference-input" data-testid="lookup-reference-input" placeholder="Enter reference code" maxlength="12">
-              <button class="btn-primary" onclick="app.lookupReservation()" data-testid="lookup-submit">Look up</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </main>
-  </div>
-
-  <script src="/static/app.js"></script>
+  <div id="app"></div>
+  <noscript><p class="noscript">Tablekeeper needs JavaScript to show live availability.</p></noscript>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

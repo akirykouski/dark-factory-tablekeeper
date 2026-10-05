@@ -1,620 +1,558 @@
-const app = (() => {
-  let state = {
-    token: localStorage.getItem('token'),
-    displayName: localStorage.getItem('displayName'),
-    restaurants: [],
-    restaurantMap: {},
-    currentSearch: null,
-    currentSearchSeq: 0,
-    selectedSlot: null,
-    selectedSlotSeq: null,
-    lastBookingKey: null,
-    lastBookingBody: null,
-    lastBookingResult: null,
-    lastSearchSeq: 0,
-  };
-
-  const API = {
-    async call(method, path, body = null, options = {}) {
-      const headers = {
-        'Content-Type': 'application/json',
-      };
-      if (options.idempotencyKey) {
-        headers['Idempotency-Key'] = options.idempotencyKey;
-      }
-      if (state.token) {
-        headers['Authorization'] = `Bearer ${state.token}`;
-      }
-
-      const init = { method, headers };
-      if (body) init.body = JSON.stringify(body);
-
-      try {
-        const response = await fetch(path, init);
-        const data = await response.json();
-        return { status: response.status, data };
-      } catch (e) {
-        throw new Error('Network error: ' + e.message);
-      }
-    },
-
-    async getRestaurants() {
-      const { data } = await API.call('GET', '/restaurants');
-      return data.restaurants;
-    },
-
-    async getRestaurant(id) {
-      const { data } = await API.call('GET', `/restaurants/${id}`);
-      return data;
-    },
-
-    async getAvailability(restaurantId, date, partySize) {
-      const { data } = await API.call('GET', `/availability?restaurant_id=${restaurantId}&date=${date}&party_size=${partySize}`);
-      return data;
-    },
-
-    async createReservation(body, key) {
-      return API.call('POST', '/reservations', body, { idempotencyKey: key });
-    },
-
-    async getReservation(ref) {
-      return API.call('GET', `/reservations/${ref}`);
-    },
-
-    async cancelReservation(ref) {
-      return API.call('POST', `/reservations/${ref}/cancel`, {});
-    },
-
-    async signup(email, password, displayName) {
-      return API.call('POST', '/auth/signup', { email, password, display_name: displayName });
-    },
-
-    async login(email, password) {
-      return API.call('POST', '/auth/login', { email, password });
-    },
-  };
-
-  const initApp = async () => {
-    try {
-      if (state.restaurants.length === 0) {
-        const restaurants = await API.getRestaurants();
-        state.restaurants = restaurants;
-        state.restaurantMap = {};
-        for (const r of restaurants) {
-          try {
-            const full = await API.getRestaurant(r.id);
-            state.restaurantMap[r.id] = full;
-          } catch (e) {
-            state.restaurantMap[r.id] = r;
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load restaurants:', e);
-    }
-  };
-
-  const router = (path) => {
-    history.pushState({}, '', path);
-    render();
-  };
-
-  const getCurrentPage = () => {
-    const path = window.location.pathname;
-    if (path === '/signup') return 'signup';
-    if (path === '/login') return 'login';
-    if (path === '/lookup') return 'lookup';
-    return 'home';
-  };
-
-  const showError = (containerId, message) => {
-    let container = document.getElementById(containerId);
-    if (!container) {
-      container = document.createElement('div');
-      container.id = containerId;
-      container.className = 'error-message visible';
-      container.dataset.testid = 'auth-error';
-      document.querySelector('[data-testid="auth-error"]')?.parentNode?.insertBefore(container, document.querySelector('[data-testid="auth-error"]'));
-    }
-    container.textContent = message;
-    container.classList.add('visible');
-    if (!container.parentNode) {
-      const page = document.getElementById(`page-${getCurrentPage()}`);
-      page?.insertBefore(container, page.firstChild);
-    }
-  };
-
-  const hideError = (containerId) => {
-    const container = document.getElementById(containerId);
-    if (container) {
-      container.remove();
-    }
-  };
-
-  const render = async () => {
-    await initApp();
-
-    const currentPage = getCurrentPage();
-
-    // Update navbar
-    const currentUserEl = document.getElementById('current-user');
-    const logoutBtn = document.getElementById('logout-button');
-    const authNav = document.getElementById('auth-nav');
-
-    if (state.token && state.displayName) {
-      currentUserEl.textContent = state.displayName;
-      currentUserEl.style.display = 'inline';
-      logoutBtn.style.display = 'inline-block';
-      authNav.style.display = 'none';
-    } else {
-      currentUserEl.style.display = 'none';
-      logoutBtn.style.display = 'none';
-      authNav.style.display = 'flex';
-    }
-
-    logoutBtn.onclick = () => {
-      state.token = null;
-      state.displayName = null;
-      localStorage.removeItem('token');
-      localStorage.removeItem('displayName');
-      router('/');
-    };
-
-    document.getElementById('page-home').style.display = currentPage === 'home' ? 'block' : 'none';
-    document.getElementById('page-signup').style.display = currentPage === 'signup' ? 'block' : 'none';
-    document.getElementById('page-login').style.display = currentPage === 'login' ? 'block' : 'none';
-    document.getElementById('page-lookup').style.display = currentPage === 'lookup' ? 'block' : 'none';
-
-    if (currentPage === 'home') {
-      renderHome();
-    }
-  };
-
-  const renderHome = () => {
-    const select = document.getElementById('restaurant-select');
-    select.innerHTML = state.restaurants.map(r => `<option value="${r.id}">${r.name}</option>`).join('');
-
-    const today = new Date().toISOString().split('T')[0];
-    document.getElementById('date-input').value = today;
-  };
-
-  const search = async () => {
-    const restaurantId = document.getElementById('restaurant-select').value;
-    const date = document.getElementById('date-input').value;
-    const partySize = document.getElementById('party-size-input').value;
-
-    if (!restaurantId || !date || !partySize) return;
-
-    state.currentSearchSeq++;
-    const searchSeq = state.currentSearchSeq;
-
-    hideError('search-auth-error');
-
-    try {
-      const availability = await API.getAvailability(restaurantId, date, partySize);
-
-      if (searchSeq !== state.currentSearchSeq) return;
-
-      state.currentSearch = {
-        restaurantId,
-        date,
-        partySize,
-        availability,
-      };
-
-      const restaurant = await API.getRestaurant(restaurantId);
-
-      if (searchSeq !== state.currentSearchSeq) return;
-
-      renderGrid(restaurant, availability, partySize);
-    } catch (e) {
-      showError('search-auth-error', 'Search failed: ' + e.message);
-    }
-  };
-
-  const renderGrid = (restaurant, availability, partySize) => {
-    const grid = document.getElementById('availability-grid');
-    const noSlots = document.getElementById('no-slots');
-
-    if (!availability.slots || availability.slots.length === 0) {
-      grid.innerHTML = '';
-      noSlots.classList.add('visible');
-      const bookingForm = document.getElementById('booking-form-container');
-      if (bookingForm) bookingForm.remove();
-      return;
-    }
-
-    noSlots.classList.remove('visible');
-    grid.innerHTML = '';
-
-    const tableMap = {};
-    restaurant.tables.forEach(t => {
-      tableMap[t.id] = t;
-    });
-
-    availability.slots.forEach(slot => {
-      const hhmm = slot.starts_at_local.split('T')[1];
-
-      const availableIds = new Set(slot.available_table_ids);
-      restaurant.tables.forEach(table => {
-        const cellId = `slot-${table.id}-${hhmm}`;
-        const isAvailable = availableIds.has(table.id);
-        const cell = createGridCell(cellId, table.label || table.id, hhmm, isAvailable, () => {
-          if (isAvailable) {
-            if (!state.token) {
-              showError('search-auth-error', 'Please sign in to book');
-              return;
-            }
-            selectSlot([table.id], table.label || table.id, hhmm, state.currentSearchSeq);
-          }
-        });
-        grid.appendChild(cell);
-      });
-
-      const displayedPairs = new Set();
-      slot.available_options?.forEach(option => {
-        if (option.table_ids.length === 2) {
-          const [id1, id2] = option.table_ids;
-          const pairKey = [id1, id2].sort().join(',');
-          if (displayedPairs.has(pairKey)) return;
-          displayedPairs.add(pairKey);
-
-          const label1 = tableMap[id1]?.label || id1;
-          const label2 = tableMap[id2]?.label || id2;
-          const cellId = `slot-${id1}+${id2}-${hhmm}`;
-          const isAvailable = true;
-          const cell = createGridCell(cellId, `${label1} + ${label2}`, hhmm, isAvailable, () => {
-            if (!state.token) {
-              showError('search-auth-error', 'Please sign in to book');
-              return;
-            }
-            selectSlot(option.table_ids, `${label1} + ${label2}`, hhmm, state.currentSearchSeq);
-          });
-          grid.appendChild(cell);
-        }
-      });
-    });
-  };
-
-  const createGridCell = (id, label, hhmm, available, onClick) => {
-    const cell = document.createElement('div');
-    cell.dataset.testid = id;
-    cell.dataset.available = available ? 'true' : 'false';
-    cell.className = 'grid-cell';
-    cell.innerHTML = `
-      <div class="grid-cell-label">${escapeHtml(label)}</div>
-      <div class="grid-cell-time">${hhmm}</div>
-    `;
-    if (available) {
-      cell.onclick = onClick;
-    }
-    return cell;
-  };
-
-  const selectSlot = (tableIds, tableLabel, hhmm, searchSeq) => {
-    // Ignore if this was from a late search
-    if (searchSeq !== state.currentSearchSeq) return;
-
-    state.selectedSlot = {
-      tableIds,
-      tableLabel,
-      hhmm,
-      restaurantId: state.currentSearch.restaurantId,
-    };
-    state.selectedSlotSeq = searchSeq;
-
-    const container = document.getElementById('booking-form-container');
-    if (container) container.remove();
-
-    const newForm = document.createElement('div');
-    newForm.id = 'booking-form-container';
-    newForm.className = 'booking-form-container visible';
-    newForm.data-testid = 'booking-form';
-    newForm.innerHTML = `
-      <div id="booking-error" class="error-message"></div>
-      <div id="booking-uncertain" class="warning-message"></div>
-      <div class="booking-summary">
-        <div class="booking-summary-label">Selected</div>
-        <div id="booking-summary" data-testid="booking-summary" class="booking-summary-value">${escapeHtml(tableLabel)} at ${hhmm}</div>
-      </div>
-      <form id="booking-form" onsubmit="app.submitBooking(event)">
-        <div class="form-group">
-          <label for="booking-party-size">Number of guests</label>
-          <input type="number" id="booking-party-size" data-testid="booking-party-size" min="1" value="${state.currentSearch.partySize}" required>
-        </div>
-        <button type="submit" class="btn-primary" data-testid="booking-submit">Book now</button>
-      </form>
-    `;
-
-    document.getElementById('page-home').appendChild(newForm);
-
-    state.lastBookingKey = null;
-    state.lastBookingBody = null;
-    state.lastBookingResult = null;
-  };
-
-  const submitBooking = async (e) => {
-    e.preventDefault();
-
-    if (!state.selectedSlot || state.selectedSlotSeq !== state.currentSearchSeq) return;
-
-    const partySize = parseInt(document.getElementById('booking-party-size').value);
-    const body = {
-      restaurant_id: state.selectedSlot.restaurantId,
-      table_ids: state.selectedSlot.tableIds,
-      starts_at_local: `${state.currentSearch.date}T${state.selectedSlot.hhmm}`,
-      party_size: partySize,
-    };
-
-    const isNewBooking = JSON.stringify(body) !== JSON.stringify(state.lastBookingBody);
-    if (isNewBooking) {
-      state.lastBookingKey = generateIdempotencyKey();
-      state.lastBookingBody = JSON.parse(JSON.stringify(body));
-      state.lastBookingResult = null;
-    }
-
-    const errorEl = document.getElementById('booking-error');
-    const uncertainEl = document.getElementById('booking-uncertain');
-    if (errorEl) errorEl.remove();
-    if (uncertainEl) uncertainEl.remove();
-
-    const button = e.target.querySelector('[type="submit"]');
-    button.disabled = true;
-
-    try {
-      const result = await API.createReservation(body, state.lastBookingKey);
-
-      if (result.status === 201 || result.status === 200) {
-        state.lastBookingResult = result.data;
-        const restaurant = state.restaurantMap[state.currentSearch.restaurantId];
-        const tableLabels = result.data.table_ids.map(tid => {
-          const table = restaurant?.tables?.find(t => t.id === tid);
-          return table?.label || tid;
-        }).join(', ');
-
-        const confEl = document.createElement('div');
-        confEl.id = 'confirmation';
-        confEl.className = 'confirmation visible';
-        confEl.dataset.testid = 'confirmation';
-        confEl.innerHTML = `
-          <h3>✓ Booking confirmed!</h3>
-          <div>Your reservation reference:</div>
-          <div id="confirmation-reference" data-testid="confirmation-reference" class="confirmation-reference">${result.data.reference}</div>
-          <div id="confirmation-details" data-testid="confirmation-details" class="confirmation-details">${restaurant?.name || 'Restaurant'} • ${state.selectedSlot.tableLabel} • ${state.selectedSlot.hhmm}</div>
-          <div id="confirmation-tables" data-testid="confirmation-tables" class="confirmation-tables">${tableLabels}</div>
-        `;
-        document.getElementById('booking-form-container').appendChild(confEl);
-
-        await search();
-      } else if (result.status === 409) {
-        const err = document.createElement('div');
-        err.id = 'booking-error';
-        err.className = 'error-message visible';
-        err.data-testid = 'booking-error';
-        err.textContent = 'Table is no longer available. Please try another.';
-        document.getElementById('booking-form-container').insertBefore(err, document.getElementById('booking-form-container').firstChild);
-        await search();
-      } else {
-        const err = document.createElement('div');
-        err.id = 'booking-error';
-        err.className = 'error-message visible';
-        err.data-testid = 'booking-error';
-        err.textContent = `Booking failed: ${result.data?.error?.code || 'Unknown error'}`;
-        document.getElementById('booking-form-container').insertBefore(err, document.getElementById('booking-form-container').firstChild);
-      }
-    } catch (e) {
-      const uncEl = document.createElement('div');
-      uncEl.id = 'booking-uncertain';
-      uncEl.className = 'warning-message visible';
-      uncEl.data-testid = 'booking-uncertain';
-      uncEl.textContent = 'Unable to confirm your booking. Your reservation may have been created. Please try again.';
-      document.getElementById('booking-form-container').insertBefore(uncEl, document.getElementById('booking-form-container').firstChild);
-    } finally {
-      button.disabled = false;
-    }
-  };
-
-  const lookupReservation = async () => {
-    const ref = document.getElementById('lookup-reference-input').value.trim().toUpperCase();
-    if (!ref) return;
-
-    const errorEl = document.getElementById('lookup-error');
-    const detailEl = document.getElementById('reservation-detail');
-    if (errorEl) errorEl.remove();
-    if (detailEl) detailEl.remove();
-
-    if (!state.token) {
-      const err = document.createElement('div');
-      err.id = 'lookup-error';
-      err.className = 'reservation-error visible';
-      err.data-testid = 'reservation-error';
-      err.textContent = 'Please sign in to look up your booking.';
-      document.getElementById('page-lookup').appendChild(err);
-      return;
-    }
-
-    try {
-      const result = await API.getReservation(ref);
-
-      if (result.status === 200) {
-        const res = result.data;
-        const restaurant = state.restaurantMap[res.restaurant_id] || state.restaurants.find(r => r.id === res.restaurant_id) || { name: 'Restaurant' };
-        const tables = res.table_ids.map(tid => {
-          const table = restaurant.tables?.find(t => t.id === tid);
-          return table?.label || tid;
-        }).join(', ');
-
-        const detail = document.createElement('div');
-        detail.id = 'reservation-detail';
-        detail.className = 'reservation-detail visible';
-        detail.data-testid = 'reservation-detail';
-        detail.dataset.ref = ref;
-        const cancelBtn = res.status === 'confirmed' ? `<button id="reservation-cancel-button" data-testid="reservation-cancel-button" class="btn-danger" onclick="app.cancelReservation()" style="margin-top: var(--spacing-lg);">Cancel reservation</button>` : '';
-        detail.innerHTML = `
-          <h2>Reservation details</h2>
-          <div class="reservation-item">
-            <span class="reservation-item-label">Restaurant</span>
-            <span id="detail-restaurant" class="reservation-item-value">${restaurant.name}</span>
-          </div>
-          <div class="reservation-item">
-            <span class="reservation-item-label">Tables</span>
-            <span id="detail-tables" data-testid="reservation-tables" class="reservation-item-value">${tables}</span>
-          </div>
-          <div class="reservation-item">
-            <span class="reservation-item-label">Time</span>
-            <span id="detail-time" class="reservation-item-value">${res.starts_at_local.split('T')[1]}</span>
-          </div>
-          <div class="reservation-item">
-            <span class="reservation-item-label">Party size</span>
-            <span id="detail-party" class="reservation-item-value">${res.party_size}</span>
-          </div>
-          <div class="reservation-item">
-            <span class="reservation-item-label">Status</span>
-            <span id="detail-status" data-testid="reservation-status" class="reservation-item-value ${res.status}">${res.status}</span>
-          </div>
-          ${cancelBtn}
-        `;
-        document.getElementById('page-lookup').appendChild(detail);
-      } else {
-        const err = document.createElement('div');
-        err.id = 'lookup-error';
-        err.className = 'reservation-error visible';
-        err.data-testid = 'reservation-error';
-        err.textContent = 'Booking not found.';
-        document.getElementById('page-lookup').appendChild(err);
-      }
-    } catch (e) {
-      const err = document.createElement('div');
-      err.id = 'lookup-error';
-      err.className = 'reservation-error visible';
-      err.data-testid = 'reservation-error';
-      err.textContent = 'Error: ' + e.message;
-      document.getElementById('page-lookup').appendChild(err);
-    }
-  };
-
-  const cancelReservation = async () => {
-    const detail = document.getElementById('reservation-detail');
-    const ref = detail?.dataset.ref;
-    if (!ref) return;
-
-    const btn = document.getElementById('reservation-cancel-button');
-    btn.disabled = true;
-
-    try {
-      const result = await API.cancelReservation(ref);
-
-      if (result.status === 200) {
-        const statusEl = document.getElementById('detail-status');
-        statusEl.textContent = 'cancelled';
-        statusEl.className = 'reservation-item-value cancelled';
-        btn.remove();
-      } else if (result.status === 409) {
-        const errorEl = document.getElementById('lookup-error');
-        if (errorEl) errorEl.remove();
-        const err = document.createElement('div');
-        err.id = 'lookup-error';
-        err.className = 'reservation-error visible';
-        err.data-testid = 'reservation-error';
-        err.textContent = 'Cannot cancel: booking is within the cancellation window.';
-        document.getElementById('page-lookup').appendChild(err);
-      } else {
-        const errorEl = document.getElementById('lookup-error');
-        if (errorEl) errorEl.remove();
-        const err = document.createElement('div');
-        err.id = 'lookup-error';
-        err.className = 'reservation-error visible';
-        err.data-testid = 'reservation-error';
-        err.textContent = 'Cancellation failed.';
-        document.getElementById('page-lookup').appendChild(err);
-      }
-    } catch (e) {
-      const errorEl = document.getElementById('lookup-error');
-      if (errorEl) errorEl.remove();
-      const err = document.createElement('div');
-      err.id = 'lookup-error';
-      err.className = 'reservation-error visible';
-      err.data-testid = 'reservation-error';
-      err.textContent = 'Error: ' + e.message;
-      document.getElementById('page-lookup').appendChild(err);
-    } finally {
-      btn.disabled = false;
-    }
-  };
-
-  const submitSignup = async (e) => {
-    e.preventDefault();
-
-    const email = document.getElementById('signup-email').value;
-    const password = document.getElementById('signup-password').value;
-    const displayName = document.getElementById('signup-display-name').value;
-
-    hideError('signup-auth-error');
-
-    try {
-      const result = await API.signup(email, password, displayName);
-
-      if (result.status === 201) {
-        state.token = result.data.token;
-        state.displayName = result.data.display_name;
-        localStorage.setItem('token', state.token);
-        localStorage.setItem('displayName', state.displayName);
-        router('/');
-      } else {
-        showError('signup-auth-error', result.data?.error?.message || 'Signup failed');
-      }
-    } catch (e) {
-      showError('signup-auth-error', 'Error: ' + e.message);
-    }
-  };
-
-  const submitLogin = async (e) => {
-    e.preventDefault();
-
-    const email = document.getElementById('login-email').value;
-    const password = document.getElementById('login-password').value;
-
-    hideError('login-auth-error');
-
-    try {
-      const result = await API.login(email, password);
-
-      if (result.status === 200) {
-        state.token = result.data.token;
-        state.displayName = result.data.display_name;
-        localStorage.setItem('token', state.token);
-        localStorage.setItem('displayName', state.displayName);
-        router('/');
-      } else {
-        showError('login-auth-error', result.data?.error?.message || 'Login failed');
-      }
-    } catch (e) {
-      showError('login-auth-error', 'Error: ' + e.message);
-    }
-  };
-
-  const generateIdempotencyKey = () => {
-    return 'key_' + Math.random().toString(36).substr(2, 9);
-  };
-
-  const escapeHtml = (text) => {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  };
-
-  window.addEventListener('popstate', render);
-
+// Tablekeeper browser client: a tiny router plus four screens.
+const TOKEN_KEY = "tk_token";
+const NAME_KEY = "tk_name";
+
+const S = {
+  token: localStorage.getItem(TOKEN_KEY),
+  name: localStorage.getItem(NAME_KEY),
+  restaurants: null,
+  details: {},
+  seq: 0,          // search sequence; only the latest response may paint
+  last: null,      // latest requested search {rid, date, party}
+  shown: null,     // search the visible grid belongs to
+  booking: null,   // open booking form state
+  gridCtx: null,
+  pageUi: null,
+};
+
+// ---------- helpers ----------
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "testid") e.setAttribute("data-testid", v);
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    e.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return e;
+}
+
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return "k-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+}
+
+class NetworkError extends Error {}
+
+async function api(method, path, body, extraHeaders) {
+  const headers = { Accept: "application/json", ...(extraHeaders || {}) };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (S.token) headers.Authorization = "Bearer " + S.token;
+  let res, text;
+  try {
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    text = await res.text();
+  } catch (e) {
+    throw new NetworkError(String(e));
+  }
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+  return { status: res.status, data };
+}
+
+const MESSAGES = {
+  table_unavailable: "Sorry, that table was just taken. Availability has been refreshed. Please pick another table or time.",
+  party_exceeds_capacity: "That party is too large for the selected table.",
+  outside_opening_hours: "The restaurant is not open at that time.",
+  not_on_slot_grid: "That start time is not offered.",
+  invalid_local_time: "That local time does not exist on this date.",
+  combination_not_allowed: "Those tables cannot be combined.",
+  validation_failed: "Please check your details: party size must be a whole number of at least 1.",
+  unauthenticated: "Please sign in to continue.",
+  not_found: "We could not find that.",
+  cutoff_passed: "It is too close to the start time to change this booking.",
+  email_taken: "That email is already registered. Try signing in instead.",
+  idempotency_key_reuse: "That request was already used with different details. Please try again.",
+};
+function humanError(res, fallback) {
+  const code = res && res.data && res.data.error && res.data.error.code;
+  return MESSAGES[code] || fallback || "Something went wrong. Please try again.";
+}
+
+function msg(kind, testid, ...kids) {
+  return h("div", { class: "msg " + kind, testid, role: kind === "error" ? "alert" : "status" },
+    h("div", { class: "msg-body" }, kids));
+}
+
+function setSession(token, name) {
+  S.token = token; S.name = name;
+  if (token) { localStorage.setItem(TOKEN_KEY, token); localStorage.setItem(NAME_KEY, name || ""); }
+  else { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(NAME_KEY); }
+}
+
+async function loadRestaurants() {
+  if (S.restaurants) return S.restaurants;
+  const res = await api("GET", "/restaurants");
+  if (res.status !== 200) throw new Error("restaurants");
+  S.restaurants = res.data.restaurants;
+  return S.restaurants;
+}
+async function getRestaurant(id) {
+  if (S.details[id]) return S.details[id];
+  const res = await api("GET", "/restaurants/" + encodeURIComponent(id));
+  if (res.status !== 200) throw new Error("restaurant");
+  S.details[id] = res.data;
+  return res.data;
+}
+const labelsOf = (r, ids) => ids.map((id) => (r.tables.find((t) => t.id === id) || { label: id }).label);
+const tableIdsOf = (res) => res.table_ids || (res.table_id ? [res.table_id] : []);
+
+function prettyDate(date) {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-GB", {
+    weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
+  });
+}
+function todayLocal() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// ---------- shell ----------
+function navigate(path) {
+  if (location.pathname !== path) history.pushState({}, "", path);
   render();
+}
 
-  return {
-    router,
-    search,
-    selectSlot,
-    submitBooking,
-    lookupReservation,
-    cancelReservation,
-    submitSignup,
-    submitLogin,
+function navLink(path, text) {
+  const a = h("a", { href: path, "data-link": "" }, text);
+  if (location.pathname === path) a.setAttribute("aria-current", "page");
+  return a;
+}
+
+function shell(content) {
+  const right = S.token
+    ? h("span", { class: "who" },
+        h("span", { testid: "current-user" }, "Signed in as ", h("strong", {}, S.name || "guest")),
+        h("button", { class: "btn secondary", type: "button", testid: "logout-button", onclick: logout }, "Sign out"))
+    : [navLink("/login", "Sign in"), navLink("/signup", "Sign up")];
+  return h("div", {},
+    h("header", { class: "topbar" },
+      h("div", { class: "topbar-inner" },
+        h("a", { class: "brand", href: "/", "data-link": "" }, "Tablekeeper"),
+        h("nav", { class: "nav", "aria-label": "Main" },
+          navLink("/", "Find a table"), navLink("/lookup", "Find my booking"), right))),
+    h("main", {}, content));
+}
+
+function logout() {
+  setSession(null, null);
+  S.booking = null;
+  render();
+}
+
+document.addEventListener("click", (ev) => {
+  const a = ev.target.closest && ev.target.closest("a[data-link]");
+  if (!a || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button !== 0) return;
+  ev.preventDefault();
+  navigate(a.getAttribute("href"));
+});
+window.addEventListener("popstate", render);
+
+function render() {
+  S.seq++;               // anything in flight for the previous screen is stale
+  const path = location.pathname;
+  const app = document.getElementById("app");
+  let content;
+  if (path === "/signup") content = authScreen("signup");
+  else if (path === "/login") content = authScreen("login");
+  else if (path === "/lookup") content = lookupScreen();
+  else content = searchScreen();
+  app.replaceChildren(shell(content));
+  if (path === "/" || path === "") afterSearchMount();
+}
+
+// ---------- auth ----------
+function authScreen(kind) {
+  const signup = kind === "signup";
+  const errBox = h("div", {});
+  const email = h("input", { id: kind + "-email", type: "email", autocomplete: "email", testid: kind + "-email", required: true });
+  const password = h("input", { id: kind + "-password", type: "password", autocomplete: signup ? "new-password" : "current-password", testid: kind + "-password", required: true });
+  const name = signup ? h("input", { id: "signup-display-name", type: "text", autocomplete: "name", testid: "signup-display-name", required: true }) : null;
+  const submit = h("button", { class: "btn", type: "submit", testid: kind + "-submit" }, signup ? "Create account" : "Sign in");
+
+  const form = h("form", { class: "form-col", novalidate: true },
+    h("div", { class: "field" }, h("label", { for: kind + "-email" }, "Email"), email),
+    signup ? h("div", { class: "field" }, h("label", { for: "signup-display-name" }, "Your name"), name) : null,
+    h("div", { class: "field" }, h("label", { for: kind + "-password" }, signup ? "Password (8+ characters)" : "Password"), password),
+    errBox,
+    submit);
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    errBox.replaceChildren();
+    submit.disabled = true;
+    submit.setAttribute("aria-busy", "true");
+    const label = submit.textContent;
+    submit.textContent = signup ? "Creating account…" : "Signing in…";
+    try {
+      const body = signup
+        ? { email: email.value, password: password.value, display_name: name.value }
+        : { email: email.value, password: password.value };
+      const res = await api("POST", signup ? "/auth/signup" : "/auth/login", body);
+      if (res.status === 200 || res.status === 201) {
+        setSession(res.data.token, res.data.display_name);
+        navigate("/");
+        return;
+      }
+      let text = humanError(res, "Could not complete that request.");
+      if (res.status === 401) text = "That email and password do not match.";
+      if (res.status === 422 && signup) text = "Please enter a valid email, a name, and a password of at least 8 characters.";
+      if (res.status === 422 && !signup) text = "Please enter your email and password.";
+      errBox.replaceChildren(msg("error", "auth-error", text));
+    } catch (e) {
+      errBox.replaceChildren(msg("error", "auth-error", "Network problem. Please try again."));
+    } finally {
+      submit.disabled = false;
+      submit.removeAttribute("aria-busy");
+      submit.textContent = label;
+    }
+  });
+
+  return h("div", { class: "stack" },
+    h("div", {}, h("h1", {}, signup ? "Create your account" : "Welcome back"),
+      h("p", { class: "lede" }, signup ? "Book tables and manage your reservations." : "Sign in to book and manage tables.")),
+    h("div", { class: "card narrow" }, form,
+      h("p", { class: "lede" }, signup ? "Already registered? " : "New here? ",
+        h("a", { href: signup ? "/login" : "/signup", "data-link": "" }, signup ? "Sign in" : "Create an account"))));
+}
+
+// ---------- search ----------
+function searchScreen() {
+  const ui = {};
+  S.pageUi = ui;
+  ui.select = h("select", { id: "restaurant", testid: "restaurant-select" });
+  ui.date = h("input", { id: "date", type: "date", testid: "date-input", value: (S.last && S.last.date) || todayLocal() });
+  ui.party = h("input", { id: "party", type: "number", min: "1", step: "1", inputmode: "numeric", testid: "party-size-input", value: (S.last && S.last.party) || "2" });
+  ui.button = h("button", { class: "btn", type: "submit", testid: "search-button" }, "Find a table");
+  ui.notice = h("div", {});
+  ui.results = h("div", {});
+  ui.booking = h("div", {});
+  const form = h("form", { class: "form-grid search", novalidate: true },
+    h("div", { class: "field" }, h("label", { for: "restaurant" }, "Restaurant"), ui.select),
+    h("div", { class: "field" }, h("label", { for: "date" }, "Date"), ui.date),
+    h("div", { class: "field" }, h("label", { for: "party" }, "Party size"), ui.party),
+    ui.button);
+  form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    startSearch({ rid: ui.select.value, date: ui.date.value, party: ui.party.value.trim() });
+  });
+  ui.results.replaceChildren(emptyState());
+  return h("div", { class: "stack" },
+    h("div", {}, h("h1", {}, "Find a table"),
+      h("p", { class: "lede" }, "Choose a restaurant, a date and your party size.")),
+    h("div", { class: "card" }, form),
+    ui.notice, ui.booking, ui.results);
+}
+
+function emptyState() {
+  return h("div", { class: "empty" }, h("strong", {}, "Pick a date and party size to see open tables"),
+    "Then choose a time and table to book.");
+}
+
+async function afterSearchMount() {
+  const ui = S.pageUi;
+  try {
+    const list = await loadRestaurants();
+    if (S.pageUi !== ui) return;
+    ui.select.replaceChildren(...list.map((r) => h("option", { value: r.id }, r.name)));
+    if (S.last) ui.select.value = S.last.rid;
+  } catch (e) {
+    if (S.pageUi === ui) ui.results.replaceChildren(msg("error", null, "We could not load the restaurants. Please reload the page."));
+  }
+  if (S.booking && S.pageUi === ui) buildBookingForm();
+}
+
+function startSearch(p) {
+  const ui = S.pageUi;
+  if (!p.rid) { ui.results.replaceChildren(msg("error", null, "Choose a restaurant first.")); return; }
+  if (!/^\d{4}-\d\d-\d\d$/.test(p.date)) { ui.results.replaceChildren(msg("error", null, "Choose a date.")); return; }
+  if (!/^\d+$/.test(p.party) || Number(p.party) < 1) { ui.results.replaceChildren(msg("error", null, "Party size must be a whole number of at least 1.")); return; }
+  ui.notice.replaceChildren();
+  runSearch(p, true);
+}
+
+async function runSearch(p, showLoading) {
+  const ui = S.pageUi;
+  const my = ++S.seq;
+  S.last = p;
+  if (showLoading) {
+    ui.button.setAttribute("aria-busy", "true");
+    ui.results.replaceChildren(h("div", { class: "loading", role: "status" }, h("span", { class: "spinner" }), "Checking availability…"));
+  }
+  try {
+    const [rest, av] = await Promise.all([
+      getRestaurant(p.rid),
+      api("GET", `/availability?restaurant_id=${encodeURIComponent(p.rid)}&date=${encodeURIComponent(p.date)}&party_size=${encodeURIComponent(p.party)}`),
+    ]);
+    if (my !== S.seq) return;
+    if (av.status !== 200) {
+      ui.results.replaceChildren(msg("error", null, humanError(av, "We could not load availability.")));
+      return;
+    }
+    S.shown = p;
+    renderGrid(ui, rest, av.data, p);
+  } catch (e) {
+    if (my !== S.seq) return;
+    ui.results.replaceChildren(msg("error", null, "We could not load availability. Check your connection and try again."));
+  } finally {
+    if (my === S.seq) ui.button.removeAttribute("aria-busy");
+  }
+}
+
+function renderGrid(ui, rest, data, p) {
+  const party = Number(p.party);
+  const slots = data.slots || [];
+  const head = h("div", { class: "results-head" },
+    h("h2", {}, `${rest.name} · ${prettyDate(p.date)}`),
+    h("ul", { class: "legend", "aria-label": "Legend" },
+      h("li", {}, h("span", { class: "swatch" }), "Available"),
+      h("li", {}, h("span", { class: "swatch off" }), "Booked"),
+      h("li", {}, h("span", { class: "swatch sel" }), "Selected")));
+  if (!slots.length) {
+    ui.results.replaceChildren(head,
+      h("div", { class: "empty", testid: "no-slots" }, h("strong", {}, "No tables on this day"),
+        `${rest.name} is closed on ${prettyDate(p.date)}. Try another date.`));
+    return;
+  }
+  const singles = rest.tables.map((t) => ({ key: t.id, ids: [t.id], label: t.label, cap: t.capacity }));
+  const capOf = (id) => (rest.tables.find((t) => t.id === id) || { capacity: 0 }).capacity;
+  const pairs = (rest.combinable || [])
+    .map((pr) => ({ key: pr.join("+"), ids: pr, label: labelsOf(rest, pr).join(" + "), cap: pr.reduce((s, id) => s + capOf(id), 0) }))
+    .filter((o) => o.cap >= party);
+  const cols = singles.concat(pairs);
+
+  const thead = h("thead", {}, h("tr", {},
+    h("th", { scope: "col", class: "time" }, "Time"),
+    cols.map((c) => h("th", { scope: "col" }, c.label, h("small", {}, `${c.cap} seats`)))));
+  const tbody = h("tbody", {});
+  for (const s of slots) {
+    const hh = s.starts_at_local.slice(11);
+    const freeSingles = new Set(s.available_table_ids || []);
+    const freePairs = new Set((s.available_options || []).filter((o) => o.table_ids.length === 2).map((o) => o.table_ids.join("+")));
+    const tr = h("tr", {}, h("th", { scope: "row", class: "time" }, hh));
+    for (const c of cols) {
+      const avail = c.ids.length === 1 ? freeSingles.has(c.key) : freePairs.has(c.key);
+      const word = avail ? "Book" : c.cap < party ? "Too small" : "Booked";
+      const btn = h("button", {
+        type: "button", class: "cell", testid: `slot-${c.key}-${hh}`, "data-available": avail ? "true" : "false",
+        "data-key": c.key, "data-time": hh,
+        "aria-label": `${c.label} at ${hh}: ${avail ? "available" : word.toLowerCase()}`,
+        "aria-disabled": avail ? null : "true",
+      }, word);
+      btn.addEventListener("click", () => {
+        if (btn.getAttribute("data-available") !== "true") return;
+        pickCell(rest, c, s.starts_at_local);
+      });
+      tr.append(h("td", {}, btn));
+    }
+    tbody.append(tr);
+  }
+  const grid = h("div", { testid: "availability-grid" },
+    h("div", { class: "grid-scroll", tabindex: "0", role: "region", "aria-label": "Availability" },
+      h("table", { class: "grid" }, thead, tbody)));
+  ui.results.replaceChildren(head, grid);
+  markSelected();
+}
+
+function markSelected() {
+  const b = S.booking;
+  const ui = S.pageUi;
+  if (!ui) return;
+  for (const c of ui.results.querySelectorAll(".cell")) {
+    const sel = !!b && S.shown && b.rid === S.shown.rid && b.tableKey === c.getAttribute("data-key") &&
+      b.local.slice(11) === c.getAttribute("data-time") && b.local.slice(0, 10) === S.shown.date;
+    c.classList.toggle("selected", sel);
+    if (sel) c.textContent = "Selected";
+    else if (c.textContent === "Selected") c.textContent = c.getAttribute("data-available") === "true" ? "Book" : "Booked";
+    if (sel) c.setAttribute("aria-pressed", "true"); else c.removeAttribute("aria-pressed");
+  }
+}
+
+// ---------- booking ----------
+function pickCell(rest, opt, local) {
+  const ui = S.pageUi;
+  if (!S.token) {
+    ui.notice.replaceChildren(msg("error", "auth-error", "Please ",
+      h("a", { href: "/login", "data-link": "" }, "sign in"), " or ",
+      h("a", { href: "/signup", "data-link": "" }, "create an account"), " to book a table."));
+    return;
+  }
+  ui.notice.replaceChildren();
+  const b = S.booking;
+  if (b && b.rid === rest.id && b.tableKey === opt.key && b.local === local) return;
+  S.booking = {
+    rid: rest.id, restaurantName: rest.name, tableIds: opt.ids, tableKey: opt.key,
+    labels: labelsOf(rest, opt.ids), cap: opt.cap, local, party: S.shown.party,
+    key: null, identity: null, busy: false, ui: null,
   };
-})();
+  buildBookingForm();
+  markSelected();
+}
+
+function buildBookingForm() {
+  const b = S.booking;
+  const ui = S.pageUi;
+  const bu = {};
+  b.ui = bu;
+  bu.party = h("input", { id: "booking-party", type: "number", min: "1", step: "1", inputmode: "numeric", testid: "booking-party-size", value: b.party });
+  bu.submit = h("button", { class: "btn", type: "submit", testid: "booking-submit" }, "Confirm booking");
+  bu.status = h("div", { class: "status" });
+  const form = h("form", { class: "card booking", testid: "booking-form", novalidate: true },
+    h("h2", {}, "Reserve this table"),
+    h("p", { class: "summary", testid: "booking-summary" },
+      `${b.labels.join(" + ")} · ${b.local.slice(11)}`),
+    h("p", { class: "summary-meta" }, `${b.restaurantName} · ${prettyDate(b.local.slice(0, 10))} · seats up to ${b.cap}`),
+    h("div", { class: "booking-row" },
+      h("div", { class: "field" }, h("label", { for: "booking-party" }, "Party size"), bu.party),
+      bu.submit),
+    bu.status);
+  form.addEventListener("submit", (ev) => { ev.preventDefault(); submitBooking(); });
+  ui.booking.replaceChildren(form);
+}
+
+function bookingBusy(b, busy) {
+  b.busy = busy;
+  b.ui.submit.disabled = busy;
+  if (busy) b.ui.submit.setAttribute("aria-busy", "true"); else b.ui.submit.removeAttribute("aria-busy");
+  b.ui.submit.textContent = busy ? "Booking…" : b.uncertain ? "Retry booking" : "Confirm booking";
+}
+
+async function submitBooking() {
+  const b = S.booking;
+  if (!b || b.busy) return;
+  const raw = b.ui.party.value.trim();
+  const body = {
+    restaurant_id: b.rid, table_ids: b.tableIds, starts_at_local: b.local,
+    party_size: raw === "" ? null : Number(raw),
+  };
+  const identity = JSON.stringify(body);
+  if (identity !== b.identity) { b.identity = identity; b.key = uuid(); }
+  b.ui.status.replaceChildren();
+  bookingBusy(b, true);
+  let res;
+  try {
+    res = await api("POST", "/reservations", body, { "Idempotency-Key": b.key });
+  } catch (e) {
+    return uncertain(b);
+  }
+  b.uncertain = false;
+  const d = res.data;
+  if ((res.status === 200 || res.status === 201) && d && d.reference) {
+    bookingBusy(b, false);
+    b.ui.status.replaceChildren(confirmation(b, d));
+    refreshGrid();
+    return;
+  }
+  if (res.status >= 500 || (res.status < 400)) return uncertain(b);
+  bookingBusy(b, false);
+  b.ui.status.replaceChildren(msg("error", "booking-error", humanError(res, "We could not complete that booking.")));
+  if (res.status === 409) refreshGrid();
+}
+
+function uncertain(b) {
+  b.uncertain = true;
+  bookingBusy(b, false);
+  b.ui.status.replaceChildren(msg("warn", "booking-uncertain",
+    "We did not hear back from the restaurant, so we cannot tell yet whether this table is booked. ",
+    "Press Retry booking to check: it is safe and will never book twice."));
+}
+
+function confirmation(b, d) {
+  const ids = tableIdsOf(d);
+  const names = ids.length ? ids.map((id) => b.labels[b.tableIds.indexOf(id)] || id) : b.labels;
+  return h("div", { class: "msg success", testid: "confirmation", role: "status" },
+    h("div", { class: "msg-body confirm-grid" },
+      h("strong", {}, "Your table is confirmed. Reference:"),
+      h("span", { class: "conf-ref", testid: "confirmation-reference" }, d.reference),
+      h("span", { testid: "confirmation-details" },
+        `${b.restaurantName} · `, h("span", { testid: "confirmation-tables" }, names.join(" + ")),
+        ` · ${prettyDate(d.starts_at_local.slice(0, 10))} at ${d.starts_at_local.slice(11)} · party of ${d.party_size}`)));
+}
+
+function refreshGrid() {
+  if (S.last && S.pageUi && location.pathname === "/") runSearch(S.last, false);
+}
+
+// ---------- lookup ----------
+function lookupScreen() {
+  const out = h("div", {});
+  const input = h("input", { id: "ref", type: "text", autocomplete: "off", autocapitalize: "characters", testid: "lookup-reference-input" });
+  const submit = h("button", { class: "btn", type: "submit", testid: "lookup-submit" }, "Find booking");
+  const form = h("form", { class: "form-grid", novalidate: true, style: "grid-template-columns:1fr" },
+    h("div", { class: "field" }, h("label", { for: "ref" }, "Booking reference"), input), submit);
+  const my = { n: 0 };
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const n = ++my.n;
+    const ref = input.value.trim();
+    if (!S.token) {
+      out.replaceChildren(msg("error", "reservation-error", "Please ",
+        h("a", { href: "/login", "data-link": "" }, "sign in"), " to look up your booking."));
+      return;
+    }
+    if (!ref) { out.replaceChildren(msg("error", "reservation-error", "Enter the reference from your confirmation.")); return; }
+    submit.setAttribute("aria-busy", "true");
+    out.replaceChildren(h("div", { class: "loading", role: "status" }, h("span", { class: "spinner" }), "Looking up…"));
+    try {
+      const res = await api("GET", "/reservations/" + encodeURIComponent(ref));
+      if (n !== my.n) return;
+      if (res.status !== 200) {
+        out.replaceChildren(msg("error", "reservation-error",
+          res.status === 404 ? "We could not find a booking with that reference under your account." : humanError(res)));
+        return;
+      }
+      const rest = await getRestaurant(res.data.restaurant_id).catch(() => null);
+      if (n !== my.n) return;
+      showReservation(out, res.data, rest, null);
+    } catch (e) {
+      if (n === my.n) out.replaceChildren(msg("error", "reservation-error", "Network problem. Please try again."));
+    } finally {
+      submit.removeAttribute("aria-busy");
+    }
+  });
+  return h("div", { class: "stack" },
+    h("div", {}, h("h1", {}, "Find my booking"),
+      h("p", { class: "lede" }, "Enter your reference to review or cancel a reservation.")),
+    h("div", { class: "card narrow" }, form),
+    out);
+}
+
+function showReservation(out, r, rest, errorText) {
+  const ids = tableIdsOf(r);
+  const names = rest ? labelsOf(rest, ids) : ids;
+  const cancelBtn = r.status === "confirmed"
+    ? h("button", { class: "btn", type: "button", testid: "reservation-cancel-button", onclick: async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true; btn.setAttribute("aria-busy", "true"); btn.textContent = "Cancelling…";
+        try {
+          const res = await api("POST", `/reservations/${encodeURIComponent(r.reference)}/cancel`);
+          if (res.status === 200 && res.data) { showReservation(out, res.data, rest, null); return; }
+          showReservation(out, r, rest, res.status === 409 && res.data && res.data.error.code === "cutoff_passed"
+            ? "This booking can no longer be cancelled online because it starts too soon. Please call the restaurant."
+            : humanError(res, "We could not cancel this booking."));
+        } catch (e) {
+          showReservation(out, r, rest, "Network problem. We could not confirm the cancellation. Please check again.");
+        }
+      } }, "Cancel booking")
+    : null;
+  out.replaceChildren(...[
+    errorText ? msg("error", "reservation-error", errorText) : null,
+    h("div", { class: "card", testid: "reservation-detail", style: errorText ? "margin-top:16px" : null },
+      h("div", { class: "row-actions" }, h("h2", {}, rest ? rest.name : "Your booking"),
+        h("span", { class: "badge " + r.status, testid: "reservation-status" }, r.status)),
+      h("dl", { class: "facts" },
+        h("dt", {}, "Reference"), h("dd", {}, r.reference),
+        h("dt", {}, "Table"), h("dd", { testid: "reservation-tables" }, names.join(" + ")),
+        h("dt", {}, "When"), h("dd", {}, `${prettyDate(r.starts_at_local.slice(0, 10))} at ${r.starts_at_local.slice(11)}`),
+        h("dt", {}, "Party"), h("dd", {}, String(r.party_size))),
+      cancelBtn ? h("div", { class: "row-actions" }, cancelBtn) : null)].filter(Boolean));
+}
+
+render();
