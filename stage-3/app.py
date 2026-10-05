@@ -28,6 +28,7 @@ class State:
         self.idempotency = {}
         self.occupancy = {}
         self.policies = {}
+        self.series = {}
         self.lock = asyncio.Lock()
 
 state = State()
@@ -346,6 +347,7 @@ def init_synthesized(rec: dict, restaurant: dict) -> None:
     rec["terms"] = policy0_terms(restaurant)
     rec["revision"] = 1
     rec["history"] = []
+    rec.setdefault("series_id", None)
     created = parse_rfc3339(rec["created_at"])
     add_history(rec, tz, "created",
                 created_changes(rec["table_ids"], rec["starts_at_local"], rec["party_size"]), at=created)
@@ -814,6 +816,7 @@ async def create_reservation(request: Request) -> JSONResponse:
             "revision": 1,
             "terms": terms,
             "history": [],
+            "series_id": None,
         }
         add_history(reservation, tz, "created", created_changes(table_ids, starts_at_local, party_size), at=now_utc)
 
@@ -876,31 +879,47 @@ async def cancel_reservation(request: Request) -> JSONResponse:
     if auth_err:
         return auth_err
 
-    res = owned_reservation(user_id, request.path_params.get("reference", ""))
-    if res is None:
-        return error_response(404, "not_found")
+    async with state.lock:
+        res = owned_reservation(user_id, request.path_params.get("reference", ""))
+        if res is None:
+            return error_response(404, "not_found")
 
-    restaurant = state.restaurants[res["restaurant_id"]]
-    tz_name = restaurant["timezone"]
+        restaurant = state.restaurants[res["restaurant_id"]]
+        tz_name = restaurant["timezone"]
 
-    if res["status"] == "cancelled":
+        if res["status"] == "cancelled":
+            # Repeated cancel does nothing
+            if res.get("series_id"):
+                series_obj = state.series.get(res["series_id"])
+                if series_obj:
+                    for member in series_obj["members"]:
+                        if member["reference"] == res["reference"]:
+                            # Series revision was already incremented, but repeated cancel should not increment again
+                            # For compatibility, we still return the response
+                            break
+            return JSONResponse(format_reservation_response(res, tz_name))
+
+        if cutoff_passed(res):
+            return error_response(409, "cutoff_passed")
+
+        res["status"] = "cancelled"
+        res["revision"] += 1
+        add_history(res, ZoneInfo(tz_name), "cancelled", [])
+
+        # Increment series revision but keep exception flag unchanged
+        if res.get("series_id"):
+            series_obj = state.series.get(res["series_id"])
+            if series_obj:
+                series_obj["revision"] += 1
+
+        starts = parse_rfc3339(res["starts_at"])
+        ends = parse_rfc3339(res["ends_at"])
+        for table_id in res["table_ids"]:
+            key = (res["restaurant_id"], table_id)
+            if key in state.occupancy:
+                state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
+
         return JSONResponse(format_reservation_response(res, tz_name))
-
-    if cutoff_passed(res):
-        return error_response(409, "cutoff_passed")
-
-    res["status"] = "cancelled"
-    res["revision"] += 1
-    add_history(res, ZoneInfo(tz_name), "cancelled", [])
-
-    starts = parse_rfc3339(res["starts_at"])
-    ends = parse_rfc3339(res["ends_at"])
-    for table_id in res["table_ids"]:
-        key = (res["restaurant_id"], table_id)
-        if key in state.occupancy:
-            state.occupancy[key] = [(s, e) for s, e in state.occupancy[key] if not (s == starts and e == ends)]
-
-    return JSONResponse(format_reservation_response(res, tz_name))
 
 
 async def patch_reservation(request: Request) -> JSONResponse:
@@ -989,6 +1008,16 @@ async def patch_reservation(request: Request) -> JSONResponse:
         res["terms"] = terms
         res["revision"] += 1
         add_history(res, ZoneInfo(tz_name), "changed", diff_changes(old, new))
+
+        # Mark as exception in series if part of one
+        if res.get("series_id"):
+            series_obj = state.series.get(res["series_id"])
+            if series_obj:
+                for member in series_obj["members"]:
+                    if member["reference"] == res["reference"]:
+                        member["exception"] = True
+                        break
+                series_obj["revision"] += 1
 
         return JSONResponse(format_reservation_response(res, tz_name))
 
@@ -1308,6 +1337,7 @@ async def reset(request: Request) -> Response:
         state.idempotency = {}
         state.occupancy = built["occupancy"]
         state.policies = {}
+        state.series = {}
 
     return Response(status_code=204)
 
@@ -1331,6 +1361,7 @@ async def export(request: Request) -> JSONResponse:
                 "reservations": list(state.reservations.values()),
                 "idempotency": idem,
                 "policies": state.policies,
+                "series": list(state.series.values()),
             },
         }
         export_data = copy.deepcopy(export_data)
@@ -1460,13 +1491,43 @@ def build_import_state(st) -> Optional[dict]:
             policies[rid] = out
         for r in restaurants.values():
             r.setdefault("manager_user_ids", [])
+
+        series_objs = {}
+        raw_series = st.get("series", [])
+        if not isinstance(raw_series, list):
+            return None
+        for s_obj in raw_series:
+            if not isinstance(s_obj, dict):
+                return None
+            for f in ("series_id", "owner", "interval_weeks", "revision"):
+                if f not in s_obj:
+                    return None
+            series_id = s_obj.get("series_id")
+            if not isinstance(series_id, str):
+                return None
+            owner = s_obj.get("owner")
+            if owner not in users:
+                return None
+            if not is_int(s_obj["interval_weeks"]) or s_obj["interval_weeks"] < 1 or s_obj["interval_weeks"] > 4:
+                return None
+            if not is_int(s_obj["revision"]) or s_obj["revision"] < 1:
+                return None
+            members = s_obj.get("members", [])
+            if not isinstance(members, list):
+                return None
+            for m in members:
+                if not isinstance(m, dict) or not isinstance(m.get("reference"), str) or not isinstance(m.get("exception"), bool):
+                    return None
+                if m["reference"] not in reservations:
+                    return None
+            series_objs[series_id] = s_obj
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
     except Exception:
         return None
     return {"users": users, "tokens": dict(st["tokens"]), "restaurants": restaurants,
             "reservations": reservations, "idempotency": idem, "occupancy": occupancy,
-            "policies": policies}
+            "policies": policies, "series": series_objs}
 
 
 async def import_(request: Request) -> Response:
@@ -1497,6 +1558,7 @@ async def import_(request: Request) -> Response:
         state.idempotency = built["idempotency"]
         state.occupancy = built["occupancy"]
         state.policies = built["policies"]
+        state.series = built["series"]
 
     return Response(status_code=204)
 
@@ -1610,6 +1672,7 @@ async def reservation_moves(request: Request) -> JSONResponse:
                 remaining.setdefault((rid, table_id), []).append((s0, e0))
 
         tz = ZoneInfo(tz_name)
+        affected_series = set()
         for r, plan in zip(resv, plans):
             if plan is None:
                 continue
@@ -1623,6 +1686,21 @@ async def reservation_moves(request: Request) -> JSONResponse:
             r["terms"] = terms
             r["revision"] += 1
             add_history(r, tz, "changed", diff_changes(old, (table_ids, local, party)))
+            # Mark as exception in series if part of one
+            if r.get("series_id"):
+                series_id = r["series_id"]
+                affected_series.add(series_id)
+                series_obj = state.series.get(series_id)
+                if series_obj:
+                    for member in series_obj["members"]:
+                        if member["reference"] == r["reference"]:
+                            member["exception"] = True
+                            break
+        # Increment affected series revisions once per batch
+        for series_id in affected_series:
+            series_obj = state.series.get(series_id)
+            if series_obj:
+                series_obj["revision"] += 1
         state.occupancy = remaining
         response_body = {"reservations": [format_reservation_response(r, tz_name) for r in resv]}
         state.idempotency[idem_key] = {
@@ -1633,6 +1711,251 @@ async def reservation_moves(request: Request) -> JSONResponse:
             "response": response_body,
         }
         return JSONResponse(response_body, status_code=201)
+
+
+async def create_series(request: Request) -> JSONResponse:
+    user_id, auth_err = await require_auth(request)
+    if auth_err:
+        return auth_err
+
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return error_response(400, "missing_idempotency_key")
+
+    if len(key) > 255:
+        return error_response(422, "validation_failed")
+
+    try:
+        body = await request.json()
+    except:
+        return error_response(400, "malformed_request")
+
+    if not isinstance(body, dict):
+        return error_response(400, "malformed_request")
+
+    async with state.lock:
+        idempotency_key = (user_id, "/series", key)
+        if idempotency_key in state.idempotency:
+            recorded = state.idempotency[idempotency_key]
+            current_json = json.dumps(body, sort_keys=True, separators=(',', ':'))
+            if current_json == recorded["body_json"]:
+                return JSONResponse(recorded["response"], status_code=200)
+            else:
+                return error_response(409, "idempotency_key_reuse")
+
+        # Validate input fields
+        anchor_ref = body.get("anchor_reference")
+        count = body.get("count")
+        interval_weeks = body.get("interval_weeks")
+
+        if not isinstance(anchor_ref, str):
+            return error_response(422, "validation_failed")
+        if not is_int(count) or count < 2 or count > 12:
+            return error_response(422, "validation_failed")
+        if not is_int(interval_weeks) or interval_weeks < 1 or interval_weeks > 4:
+            return error_response(422, "validation_failed")
+
+        # Anchor validation
+        if anchor_ref not in state.reservations:
+            return error_response(404, "not_found")
+
+        anchor = state.reservations[anchor_ref]
+        if anchor["user_id"] != user_id:
+            return error_response(404, "not_found")
+        if anchor["status"] != "confirmed":
+            return error_response(409, "reservation_cancelled")
+        if anchor["series_id"] is not None:
+            return error_response(409, "already_in_series")
+
+        # Check cutoff
+        restaurant = state.restaurants[anchor["restaurant_id"]]
+        tz = ZoneInfo(restaurant["timezone"])
+        now_utc = get_now_utc()
+        now_local = now_utc.astimezone(tz)
+        anchor_start = parse_rfc3339(anchor["starts_at"])
+        anchor_cutoff_minutes = anchor["terms"]["cancellation_cutoff_minutes"]
+        cutoff_time = anchor_start - timedelta(minutes=anchor_cutoff_minutes)
+        if now_utc > cutoff_time:
+            return error_response(409, "cutoff_passed")
+
+        # Build occurrences
+        anchor_date = anchor["starts_at_local"][:10]
+        anchor_time = anchor["starts_at_local"][11:16]
+        anchor_year, anchor_month, anchor_day = int(anchor_date[:4]), int(anchor_date[5:7]), int(anchor_date[8:10])
+        anchor_hour, anchor_minute = int(anchor_time[:2]), int(anchor_time[3:5])
+
+        occurrences = []
+        occ_data_list = []  # Store all occurrence data before committing
+        all_table_ids = anchor["table_ids"]
+        party_size = anchor["party_size"]
+
+        for i in range(count):
+            if i == 0:
+                # Anchor is unchanged
+                occurrences.append({
+                    "index": 0,
+                    "reference": anchor_ref,
+                    "exception": False,
+                    "reservation": format_reservation_response(anchor, restaurant["timezone"]),
+                })
+                continue
+
+            # Calculate next date with DST handling
+            occ_date = datetime(anchor_year, anchor_month, anchor_day) + timedelta(days=i * interval_weeks * 7)
+            occ_year, occ_month, occ_day = occ_date.year, occ_date.month, occ_date.day
+            occ_local_str = f"{occ_year:04d}-{occ_month:02d}-{occ_day:02d}T{anchor_hour:02d}:{anchor_minute:02d}"
+
+            # Try to build a reservation for this occurrence
+            err, occ_start_utc, occ_end_utc, occ_terms = evaluate(restaurant, all_table_ids, occ_local_str, party_size)
+            if err:
+                # First failing index returns the error, nothing is stored
+                return err
+
+            # Check occupancy for all tables in the set (including previously generated occurrences)
+            for tid in all_table_ids:
+                if is_occupied(restaurant["id"], tid, occ_start_utc, occ_end_utc):
+                    # Check if it conflicts with a previously generated occurrence
+                    already_conflicted = False
+                    for prev_occ in occ_data_list:
+                        if tid in prev_occ["table_ids"]:
+                            prev_start = prev_occ["starts_utc"]
+                            prev_end = prev_occ["ends_utc"]
+                            if occ_start_utc < prev_end and occ_end_utc > prev_start:
+                                already_conflicted = True
+                                break
+                    if not already_conflicted:
+                        return error_response(409, "table_unavailable")
+
+            # Create the occurrence reservation
+            occ_id = f"res_{uuid.uuid4().hex[:16]}"
+            occ_ref = generate_reference()
+            while occ_ref in state.reservations or any(od["reference"] == occ_ref for od in occ_data_list):
+                occ_ref = generate_reference()
+
+            occ_now_utc = get_now_utc()
+
+            occ_res = {
+                "reservation_id": occ_id,
+                "reference": occ_ref,
+                "restaurant_id": restaurant["id"],
+                "table_ids": all_table_ids,
+                "party_size": party_size,
+                "status": "confirmed",
+                "starts_at_local": occ_local_str,
+                "starts_at": format_rfc3339(occ_start_utc),
+                "ends_at": format_rfc3339(occ_end_utc),
+                "created_at": format_rfc3339(occ_now_utc),
+                "user_id": user_id,
+                "revision": 1,
+                "terms": occ_terms,
+                "history": [],
+                "series_id": None,  # Will be set after series is created
+            }
+
+            add_history(occ_res, tz, "created", created_changes(all_table_ids, occ_local_str, party_size), at=occ_now_utc)
+            occurrences.append({
+                "index": i,
+                "reference": occ_ref,
+                "exception": False,
+                "reservation": format_reservation_response(occ_res, restaurant["timezone"]),
+            })
+
+            # Store data for later commit
+            occ_data_list.append({
+                "reference": occ_ref,
+                "table_ids": all_table_ids,
+                "starts_utc": occ_start_utc,
+                "ends_utc": occ_end_utc,
+                "res": occ_res,
+            })
+
+        # Commit all occurrences to state
+        for occ_data in occ_data_list:
+            occ_res = occ_data["res"]
+            occ_ref = occ_data["reference"]
+            state.reservations[occ_ref] = occ_res
+            for tid in occ_data["table_ids"]:
+                state.occupancy.setdefault((restaurant["id"], tid), []).append((occ_data["starts_utc"], occ_data["ends_utc"]))
+
+        # Create the series
+        series_id = f"ser_{uuid.uuid4().hex[:16]}"
+        series_obj = {
+            "series_id": series_id,
+            "owner": user_id,
+            "restaurant_id": anchor["restaurant_id"],
+            "interval_weeks": interval_weeks,
+            "revision": 1,
+            "members": [],
+        }
+
+        # Link all occurrences to the series
+        anchor["series_id"] = series_id
+        for i, occ_data in enumerate(occurrences):
+            if i == 0:
+                member = {"index": 0, "reference": anchor_ref, "exception": False}
+            else:
+                occ_ref = occ_data["reference"]
+                occ_res = state.reservations[occ_ref]
+                occ_res["series_id"] = series_id
+                member = {"index": i, "reference": occ_ref, "exception": False}
+            series_obj["members"].append(member)
+
+        state.series[series_id] = series_obj
+
+        response_body = {
+            "series_id": series_id,
+            "revision": 1,
+            "interval_weeks": interval_weeks,
+            "occurrences": occurrences,
+        }
+
+        state.idempotency[idempotency_key] = {
+            "method": "POST",
+            "path": "/series",
+            "body_json": json.dumps(body, sort_keys=True, separators=(',', ':')),
+            "response": response_body,
+        }
+
+        return JSONResponse(response_body, status_code=201)
+
+
+async def get_series(request: Request) -> JSONResponse:
+    user_id, _ = await require_auth(request)
+
+    series_id = request.path_params.get("id", "")
+
+    async with state.lock:
+        if series_id not in state.series:
+            return error_response(404, "not_found")
+
+        series_obj = state.series[series_id]
+        if user_id is None or series_obj["owner"] != user_id:
+            return error_response(404, "not_found")
+
+        occurrences = []
+        for member in series_obj["members"]:
+            ref = member["reference"]
+            if ref not in state.reservations:
+                return error_response(500, "internal_error")
+
+            res = state.reservations[ref]
+            restaurant = state.restaurants[res["restaurant_id"]]
+            occ_data = {
+                "index": member["index"],
+                "reference": ref,
+                "exception": member["exception"],
+                "reservation": format_reservation_response(res, restaurant["timezone"]),
+            }
+            occurrences.append(occ_data)
+
+        response = {
+            "series_id": series_id,
+            "revision": series_obj["revision"],
+            "interval_weeks": series_obj["interval_weeks"],
+            "occurrences": occurrences,
+        }
+
+        return JSONResponse(response, status_code=200)
 
 
 async def not_found(request: Request) -> JSONResponse:
@@ -1693,6 +2016,8 @@ routes = [
     Route("/restaurants/{id}/policies", list_policies, methods=["GET"]),
     Route("/reservations/{reference}", patch_reservation, methods=["PATCH"]),
     Route("/reservation-moves", reservation_moves, methods=["POST"]),
+    Route("/series", create_series, methods=["POST"]),
+    Route("/series/{id}", get_series, methods=["GET"]),
     Route("/static/{path:path}", serve_static, methods=["GET"]),
     Route("/", serve_index, methods=["GET"]),
     Route("/signup", serve_index, methods=["GET"]),
