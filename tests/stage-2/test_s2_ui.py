@@ -534,3 +534,19 @@ def test_session_and_pending_retry_survive_import(desk, api_ui):
     tid(desk, "booking-submit").click()  # still the same
     desk.wait_for_timeout(500)
     expect(tid(desk, "confirmation-reference")).to_have_text(ref)
+
+
+def test_pair_cells_in_every_slot(desk, api_ui):
+    # S2-36: a pair cell is rendered in every slot when the pair's seats fit the party,
+    # and reads false where the pair is not in available_options.
+    tok = api_ui.login("bob@example.com", "battery staple")
+    api_ui.book(tok, table_id="t_1", local=f"{THU}T19:00")
+    login(desk)
+    search(desk, THU, 2)
+    for hh in ["18:00", "19:00", "20:00", "21:30"]:
+        expect(cell(desk, "t_1+t_2", hh)).to_have_count(1)
+    expect(cell(desk, "t_1+t_2", "19:00")).to_have_attribute("data-available", "false")
+    expect(cell(desk, "t_1+t_2", "21:00")).to_have_attribute("data-available", "true")
+    # party larger than the pair: no pair cells at all
+    search(desk, THU, 7)
+    expect(desk.locator("[data-testid^='slot-t_1+t_2-']")).to_have_count(0)
