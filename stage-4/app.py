@@ -805,7 +805,7 @@ async def create_reservation(request: Request) -> JSONResponse:
             return err
 
         for table_id in table_ids:
-            if is_occupied(restaurant_id, table_id, starts_utc, ends_utc):
+            if is_occupied(restaurant_id, table_id, starts_utc, ends_utc) or is_closed(restaurant_id, table_id, starts_utc, ends_utc):
                 return error_response(409, "table_unavailable")
 
         reservation_id = f"res_{uuid.uuid4().hex[:16]}"
@@ -1013,6 +1013,9 @@ async def patch_reservation(request: Request) -> JSONResponse:
                     continue
                 if starts_utc < e and ends_utc > s:
                     return error_response(409, "table_unavailable")
+            # Check closures
+            if is_closed(rid, table_id, starts_utc, ends_utc):
+                return error_response(409, "table_unavailable")
 
         for table_id in res["table_ids"]:
             key = (rid, table_id)
