@@ -806,89 +806,115 @@ async def patch_reservation(request: Request) -> JSONResponse:
     return JSONResponse(format_reservation_response(res, tz_name))
 
 
+def _valid_id(v) -> bool:
+    return isinstance(v, str) and 0 < len(v) <= 64
+
+
+def build_fixture_state(body: dict) -> Optional[dict]:
+    """Validate a whole fixture and build fresh state. None if invalid."""
+    users = body.get("users", [])
+    restaurants = body.get("restaurants", [])
+    reservations = body.get("reservations", [])
+    for lst in (users, restaurants, reservations):
+        if not isinstance(lst, list) or not all(isinstance(x, dict) for x in lst):
+            return None
+
+    new_users = {}
+    for u in users:
+        if not _valid_id(u.get("id")):
+            return None
+        email, password = u.get("email"), u.get("password")
+        if not isinstance(email, str) or not isinstance(password, str):
+            return None
+        if not isinstance(u.get("display_name"), str):
+            return None
+        password_hash, password_salt = hash_password(password)
+        new_users[u["id"]] = {
+            "id": u["id"],
+            "email_lower": email.lower(),
+            "password_hash": password_hash,
+            "password_salt": password_salt,
+            "display_name": u["display_name"],
+        }
+
+    new_restaurants = {}
+    for r in restaurants:
+        if not _valid_id(r.get("id")):
+            return None
+        for t in r.get("tables") or []:
+            if not isinstance(t, dict) or not _valid_id(t.get("id")):
+                return None
+        new_restaurants[r["id"]] = r
+
+    new_res = {}
+    new_occ = {}
+    now = get_now_utc()
+    for rd in reservations:
+        rid, ref, uid = rd.get("id"), rd.get("reference"), rd.get("user_id")
+        if not (_valid_id(rid) and _valid_id(ref) and _valid_id(uid)):
+            return None
+        if ref in new_res:
+            return None
+        restaurant = new_restaurants.get(rd.get("restaurant_id"))
+        if restaurant is None:
+            return None
+        table_id = rd.get("table_id")
+        if not any(isinstance(t, dict) and t.get("id") == table_id
+                   for t in restaurant.get("tables") or []):
+            return None
+        party = rd.get("party_size")
+        if isinstance(party, bool) or not isinstance(party, int) or party < 1:
+            return None
+        try:
+            starts_utc = from_local_time(rd.get("starts_at_local"), restaurant["timezone"])
+            ends_utc = starts_utc + timedelta(minutes=restaurant["reservation_duration_minutes"])
+        except (TypeError, KeyError, ValueError):
+            return None
+        if starts_utc is None:
+            return None
+        created = rd.get("created_at")
+        if created is None:
+            created = format_rfc3339(now)
+        elif not isinstance(created, str):
+            return None
+        new_res[ref] = {
+            "reservation_id": rid,
+            "reference": ref,
+            "restaurant_id": rd["restaurant_id"],
+            "table_id": table_id,
+            "party_size": party,
+            "status": "confirmed",
+            "starts_at_local": rd["starts_at_local"],
+            "starts_at": format_rfc3339(starts_utc),
+            "ends_at": format_rfc3339(ends_utc),
+            "created_at": created,
+            "user_id": uid,
+        }
+        new_occ.setdefault((rd["restaurant_id"], table_id), []).append((starts_utc, ends_utc))
+
+    return {"users": new_users, "restaurants": new_restaurants,
+            "reservations": new_res, "occupancy": new_occ}
+
+
 async def reset(request: Request) -> Response:
     try:
         body = await request.json()
-    except:
+    except Exception:
         return error_response(400, "malformed_request")
 
     if not isinstance(body, dict):
         return error_response(400, "malformed_request")
 
-    users = body.get("users", [])
-    restaurants = body.get("restaurants", [])
-    reservations = body.get("reservations", [])
-
-    for uid in [u.get("id") for u in users]:
-        if uid and len(uid) > 64:
+    async with state.lock:
+        built = build_fixture_state(body)
+        if built is None:
             return error_response(422, "validation_failed")
-
-    for rid in [r.get("id") for r in restaurants]:
-        if rid and len(rid) > 64:
-            return error_response(422, "validation_failed")
-
-    for res in reservations:
-        if res.get("id") and len(res.get("id", "")) > 64:
-            return error_response(422, "validation_failed")
-
-    state.users.clear()
-    state.tokens.clear()
-    state.restaurants.clear()
-    state.reservations.clear()
-    state.idempotency.clear()
-    state.occupancy.clear()
-
-    for user_data in users:
-        uid = user_data.get("id")
-        email = user_data.get("email")
-        password = user_data.get("password")
-        display_name = user_data.get("display_name")
-
-        email_lower = email.lower() if email else ""
-        password_hash, password_salt = hash_password(password) if password else ("", "")
-
-        state.users[uid] = {
-            "id": uid,
-            "email_lower": email_lower,
-            "password_hash": password_hash,
-            "password_salt": password_salt,
-            "display_name": display_name,
-        }
-
-    for restaurant_data in restaurants:
-        rid = restaurant_data.get("id")
-        state.restaurants[rid] = restaurant_data
-
-    for res_data in reservations:
-        ref = res_data.get("reference")
-        user_id = res_data.get("user_id")
-
-        # Seeded reservation must have reference and timestamps
-        if not ref or "starts_at" not in res_data or "ends_at" not in res_data:
-            continue
-
-        # Map fixture 'id' to 'reservation_id' if needed
-        reservation_id = res_data.get("reservation_id") or res_data.get("id")
-        state.reservations[ref] = {
-            **res_data,
-            "reservation_id": reservation_id,
-            "status": res_data.get("status", "confirmed"),
-            "user_id": user_id,
-        }
-
-        if res_data.get("status") == "confirmed" or res_data.get("status") is None:
-            restaurant_id = res_data.get("restaurant_id")
-            table_id = res_data.get("table_id")
-            try:
-                starts_at = parse_rfc3339(res_data["starts_at"])
-                ends_at = parse_rfc3339(res_data["ends_at"])
-
-                key = (restaurant_id, table_id)
-                if key not in state.occupancy:
-                    state.occupancy[key] = []
-                state.occupancy[key].append((starts_at, ends_at))
-            except (ValueError, KeyError):
-                pass
+        state.users = built["users"]
+        state.tokens = {}
+        state.restaurants = built["restaurants"]
+        state.reservations = built["reservations"]
+        state.idempotency = {}
+        state.occupancy = built["occupancy"]
 
     return Response(status_code=204)
 
