@@ -47,46 +47,19 @@
           </div>
         </div>
 
-        <div id="search-auth-error" data-testid="auth-error" class="error-message"></div>
-
         <div class="grid-wrapper">
           <div id="no-slots" data-testid="no-slots" class="no-slots">No availability for this date</div>
           <div id="availability-grid" data-testid="availability-grid" class="availability-grid"></div>
         </div>
 
         <!-- Booking form -->
-        <div id="booking-form-container" class="booking-form-container">
-          <div id="booking-error" data-testid="booking-error" class="error-message"></div>
-          <div id="booking-uncertain" data-testid="booking-uncertain" class="warning-message"></div>
-
-          <div class="booking-summary">
-            <div class="booking-summary-label">Selected</div>
-            <div id="booking-summary" data-testid="booking-summary" class="booking-summary-value"></div>
-          </div>
-
-          <form id="booking-form" onsubmit="app.submitBooking(event)">
-            <div class="form-group">
-              <label for="booking-party-size">Number of guests</label>
-              <input type="number" id="booking-party-size" data-testid="booking-party-size" min="1" required>
-            </div>
-            <button type="submit" class="btn-primary" data-testid="booking-submit">Book now</button>
-          </form>
-
-          <div id="confirmation" data-testid="confirmation" class="confirmation">
-            <h3>✓ Booking confirmed!</h3>
-            <div>Your reservation reference:</div>
-            <div id="confirmation-reference" data-testid="confirmation-reference" class="confirmation-reference"></div>
-            <div id="confirmation-details" data-testid="confirmation-details" class="confirmation-details"></div>
-            <div id="confirmation-tables" data-testid="confirmation-tables" class="confirmation-tables"></div>
-          </div>
-        </div>
+        <div id="booking-form-container" data-testid="booking-form" class="booking-form-container"></div>
       </div>
 
       <!-- Signup -->
       <div id="page-signup" style="display: none;">
         <div class="auth-container">
           <h1>Sign up</h1>
-          <div id="signup-auth-error" data-testid="auth-error" class="error-message"></div>
 
           <form id="signup-form" onsubmit="app.submitSignup(event)">
             <div class="form-group">
@@ -111,7 +84,6 @@
       <div id="page-login" style="display: none;">
         <div class="auth-container">
           <h1>Sign in</h1>
-          <div id="login-auth-error" data-testid="auth-error" class="error-message"></div>
 
           <form id="login-form" onsubmit="app.submitLogin(event)">
             <div class="form-group">
@@ -139,33 +111,6 @@
               <input type="text" id="lookup-reference-input" data-testid="lookup-reference-input" placeholder="Enter reference code" maxlength="12">
               <button class="btn-primary" onclick="app.lookupReservation()" data-testid="lookup-submit">Look up</button>
             </div>
-          </div>
-
-          <div id="lookup-error" data-testid="reservation-error" class="reservation-error"></div>
-
-          <div id="reservation-detail" data-testid="reservation-detail" class="reservation-detail">
-            <h2>Reservation details</h2>
-            <div class="reservation-item">
-              <span class="reservation-item-label">Restaurant</span>
-              <span id="detail-restaurant" class="reservation-item-value"></span>
-            </div>
-            <div class="reservation-item">
-              <span class="reservation-item-label">Tables</span>
-              <span id="detail-tables" data-testid="reservation-tables" class="reservation-item-value"></span>
-            </div>
-            <div class="reservation-item">
-              <span class="reservation-item-label">Time</span>
-              <span id="detail-time" class="reservation-item-value"></span>
-            </div>
-            <div class="reservation-item">
-              <span class="reservation-item-label">Party size</span>
-              <span id="detail-party" class="reservation-item-value"></span>
-            </div>
-            <div class="reservation-item">
-              <span class="reservation-item-label">Status</span>
-              <span id="detail-status" data-testid="reservation-status" class="reservation-item-value"></span>
-            </div>
-            <button id="reservation-cancel-button" data-testid="reservation-cancel-button" class="btn-danger" onclick="app.cancelReservation()" style="margin-top: var(--spacing-lg);">Cancel reservation</button>
           </div>
         </div>
       </div>

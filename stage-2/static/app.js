@@ -7,31 +7,11 @@ const app = (() => {
     currentSearch: null,
     currentSearchSeq: 0,
     selectedSlot: null,
+    selectedSlotSeq: null,
     lastBookingKey: null,
     lastBookingBody: null,
     lastBookingResult: null,
     lastSearchSeq: 0,
-  };
-
-  const initApp = async () => {
-    try {
-      if (state.restaurants.length === 0) {
-        const restaurants = await API.getRestaurants();
-        state.restaurants = restaurants;
-        state.restaurantMap = {};
-        for (const r of restaurants) {
-          try {
-            const full = await API.getRestaurant(r.id);
-            state.restaurantMap[r.id] = full;
-          } catch (e) {
-            // Fallback to basic data
-            state.restaurantMap[r.id] = r;
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load restaurants:', e);
-    }
   };
 
   const API = {
@@ -94,6 +74,26 @@ const app = (() => {
     },
   };
 
+  const initApp = async () => {
+    try {
+      if (state.restaurants.length === 0) {
+        const restaurants = await API.getRestaurants();
+        state.restaurants = restaurants;
+        state.restaurantMap = {};
+        for (const r of restaurants) {
+          try {
+            const full = await API.getRestaurant(r.id);
+            state.restaurantMap[r.id] = full;
+          } catch (e) {
+            state.restaurantMap[r.id] = r;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load restaurants:', e);
+    }
+  };
+
   const router = (path) => {
     history.pushState({}, '', path);
     render();
@@ -105,6 +105,30 @@ const app = (() => {
     if (path === '/login') return 'login';
     if (path === '/lookup') return 'lookup';
     return 'home';
+  };
+
+  const showError = (containerId, message) => {
+    let container = document.getElementById(containerId);
+    if (!container) {
+      container = document.createElement('div');
+      container.id = containerId;
+      container.className = 'error-message visible';
+      container.dataset.testid = 'auth-error';
+      document.querySelector('[data-testid="auth-error"]')?.parentNode?.insertBefore(container, document.querySelector('[data-testid="auth-error"]'));
+    }
+    container.textContent = message;
+    container.classList.add('visible');
+    if (!container.parentNode) {
+      const page = document.getElementById(`page-${getCurrentPage()}`);
+      page?.insertBefore(container, page.firstChild);
+    }
+  };
+
+  const hideError = (containerId) => {
+    const container = document.getElementById(containerId);
+    if (container) {
+      container.remove();
+    }
   };
 
   const render = async () => {
@@ -128,7 +152,6 @@ const app = (() => {
       authNav.style.display = 'flex';
     }
 
-    // Clear logout button click handler and re-add
     logoutBtn.onclick = () => {
       state.token = null;
       state.displayName = null;
@@ -137,7 +160,6 @@ const app = (() => {
       router('/');
     };
 
-    // Show/hide pages
     document.getElementById('page-home').style.display = currentPage === 'home' ? 'block' : 'none';
     document.getElementById('page-signup').style.display = currentPage === 'signup' ? 'block' : 'none';
     document.getElementById('page-login').style.display = currentPage === 'login' ? 'block' : 'none';
@@ -166,11 +188,11 @@ const app = (() => {
     state.currentSearchSeq++;
     const searchSeq = state.currentSearchSeq;
 
+    hideError('search-auth-error');
+
     try {
-      document.getElementById('search-auth-error').style.display = 'none';
       const availability = await API.getAvailability(restaurantId, date, partySize);
 
-      // Ignore if a newer search has started
       if (searchSeq !== state.currentSearchSeq) return;
 
       state.currentSearch = {
@@ -180,16 +202,13 @@ const app = (() => {
         availability,
       };
 
-      // Get restaurant details for labels
       const restaurant = await API.getRestaurant(restaurantId);
 
-      // Re-check search seq in case another request completed while we were waiting
       if (searchSeq !== state.currentSearchSeq) return;
 
       renderGrid(restaurant, availability, partySize);
     } catch (e) {
-      document.getElementById('search-auth-error').textContent = 'Search failed: ' + e.message;
-      document.getElementById('search-auth-error').style.display = 'block';
+      showError('search-auth-error', 'Search failed: ' + e.message);
     }
   };
 
@@ -200,7 +219,8 @@ const app = (() => {
     if (!availability.slots || availability.slots.length === 0) {
       grid.innerHTML = '';
       noSlots.classList.add('visible');
-      document.getElementById('booking-form-container').classList.remove('visible');
+      const bookingForm = document.getElementById('booking-form-container');
+      if (bookingForm) bookingForm.remove();
       return;
     }
 
@@ -215,7 +235,6 @@ const app = (() => {
     availability.slots.forEach(slot => {
       const hhmm = slot.starts_at_local.split('T')[1];
 
-      // Single tables
       const availableIds = new Set(slot.available_table_ids);
       restaurant.tables.forEach(table => {
         const cellId = `slot-${table.id}-${hhmm}`;
@@ -223,17 +242,15 @@ const app = (() => {
         const cell = createGridCell(cellId, table.label || table.id, hhmm, isAvailable, () => {
           if (isAvailable) {
             if (!state.token) {
-              document.getElementById('search-auth-error').textContent = 'Please sign in to book';
-              document.getElementById('search-auth-error').style.display = 'block';
+              showError('search-auth-error', 'Please sign in to book');
               return;
             }
-            selectSlot([table.id], table.label || table.id, hhmm);
+            selectSlot([table.id], table.label || table.id, hhmm, state.currentSearchSeq);
           }
         });
         grid.appendChild(cell);
       });
 
-      // Combination pairs - get from available_options
       const displayedPairs = new Set();
       slot.available_options?.forEach(option => {
         if (option.table_ids.length === 2) {
@@ -245,14 +262,13 @@ const app = (() => {
           const label1 = tableMap[id1]?.label || id1;
           const label2 = tableMap[id2]?.label || id2;
           const cellId = `slot-${id1}+${id2}-${hhmm}`;
-          const isAvailable = true; // It's in available_options, so it's available
+          const isAvailable = true;
           const cell = createGridCell(cellId, `${label1} + ${label2}`, hhmm, isAvailable, () => {
             if (!state.token) {
-              document.getElementById('search-auth-error').textContent = 'Please sign in to book';
-              document.getElementById('search-auth-error').style.display = 'block';
+              showError('search-auth-error', 'Please sign in to book');
               return;
             }
-            selectSlot(option.table_ids, `${label1} + ${label2}`, hhmm);
+            selectSlot(option.table_ids, `${label1} + ${label2}`, hhmm, state.currentSearchSeq);
           });
           grid.appendChild(cell);
         }
@@ -275,35 +291,52 @@ const app = (() => {
     return cell;
   };
 
-  const selectSlot = (tableIds, tableLabel, hhmm) => {
+  const selectSlot = (tableIds, tableLabel, hhmm, searchSeq) => {
+    // Ignore if this was from a late search
+    if (searchSeq !== state.currentSearchSeq) return;
+
     state.selectedSlot = {
       tableIds,
       tableLabel,
       hhmm,
       restaurantId: state.currentSearch.restaurantId,
     };
+    state.selectedSlotSeq = searchSeq;
 
     const container = document.getElementById('booking-form-container');
-    container.classList.add('visible');
+    if (container) container.remove();
 
-    document.getElementById('booking-summary').textContent = `${tableLabel} at ${hhmm}`;
-    document.getElementById('booking-party-size').value = state.currentSearch.partySize;
-    document.getElementById('booking-error').style.display = 'none';
-    document.getElementById('booking-uncertain').style.display = 'none';
-    document.getElementById('confirmation').classList.remove('visible');
+    const newForm = document.createElement('div');
+    newForm.id = 'booking-form-container';
+    newForm.className = 'booking-form-container visible';
+    newForm.data-testid = 'booking-form';
+    newForm.innerHTML = `
+      <div id="booking-error" class="error-message"></div>
+      <div id="booking-uncertain" class="warning-message"></div>
+      <div class="booking-summary">
+        <div class="booking-summary-label">Selected</div>
+        <div id="booking-summary" data-testid="booking-summary" class="booking-summary-value">${escapeHtml(tableLabel)} at ${hhmm}</div>
+      </div>
+      <form id="booking-form" onsubmit="app.submitBooking(event)">
+        <div class="form-group">
+          <label for="booking-party-size">Number of guests</label>
+          <input type="number" id="booking-party-size" data-testid="booking-party-size" min="1" value="${state.currentSearch.partySize}" required>
+        </div>
+        <button type="submit" class="btn-primary" data-testid="booking-submit">Book now</button>
+      </form>
+    `;
 
-    // Generate new idempotency key for new form
+    document.getElementById('page-home').appendChild(newForm);
+
     state.lastBookingKey = null;
     state.lastBookingBody = null;
     state.lastBookingResult = null;
-
-    document.getElementById('booking-form').onsubmit = (e) => submitBooking(e);
   };
 
   const submitBooking = async (e) => {
     e.preventDefault();
 
-    if (!state.selectedSlot) return;
+    if (!state.selectedSlot || state.selectedSlotSeq !== state.currentSearchSeq) return;
 
     const partySize = parseInt(document.getElementById('booking-party-size').value);
     const body = {
@@ -313,7 +346,6 @@ const app = (() => {
       party_size: partySize,
     };
 
-    // Generate idempotency key if this is a new booking
     const isNewBooking = JSON.stringify(body) !== JSON.stringify(state.lastBookingBody);
     if (isNewBooking) {
       state.lastBookingKey = generateIdempotencyKey();
@@ -321,41 +353,62 @@ const app = (() => {
       state.lastBookingResult = null;
     }
 
+    const errorEl = document.getElementById('booking-error');
+    const uncertainEl = document.getElementById('booking-uncertain');
+    if (errorEl) errorEl.remove();
+    if (uncertainEl) uncertainEl.remove();
+
     const button = e.target.querySelector('[type="submit"]');
     button.disabled = true;
-
-    document.getElementById('booking-error').style.display = 'none';
-    document.getElementById('booking-uncertain').style.display = 'none';
 
     try {
       const result = await API.createReservation(body, state.lastBookingKey);
 
       if (result.status === 201 || result.status === 200) {
         state.lastBookingResult = result.data;
-        document.getElementById('confirmation-reference').textContent = result.data.reference;
-        document.getElementById('confirmation-details').textContent =
-          `${state.currentSearch.restaurantId === 'r_anker' ? 'Anker' : 'Hudson'} • ${state.selectedSlot.tableLabel} • ${state.selectedSlot.hhmm}`;
-        document.getElementById('confirmation-tables').textContent = result.data.table_ids.map(tid => {
-          const table = state.restaurants.find(r => r.id === state.currentSearch.restaurantId)?.tables?.find(t => t.id === tid);
+        const restaurant = state.restaurantMap[state.currentSearch.restaurantId];
+        const tableLabels = result.data.table_ids.map(tid => {
+          const table = restaurant?.tables?.find(t => t.id === tid);
           return table?.label || tid;
         }).join(', ');
-        document.getElementById('confirmation').classList.add('visible');
 
-        // Refresh grid
+        const confEl = document.createElement('div');
+        confEl.id = 'confirmation';
+        confEl.className = 'confirmation visible';
+        confEl.dataset.testid = 'confirmation';
+        confEl.innerHTML = `
+          <h3>✓ Booking confirmed!</h3>
+          <div>Your reservation reference:</div>
+          <div id="confirmation-reference" data-testid="confirmation-reference" class="confirmation-reference">${result.data.reference}</div>
+          <div id="confirmation-details" data-testid="confirmation-details" class="confirmation-details">${restaurant?.name || 'Restaurant'} • ${state.selectedSlot.tableLabel} • ${state.selectedSlot.hhmm}</div>
+          <div id="confirmation-tables" data-testid="confirmation-tables" class="confirmation-tables">${tableLabels}</div>
+        `;
+        document.getElementById('booking-form-container').appendChild(confEl);
+
         await search();
       } else if (result.status === 409) {
-        document.getElementById('booking-error').textContent = 'Table is no longer available. Please try another.';
-        document.getElementById('booking-error').style.display = 'block';
-        // Refresh grid
+        const err = document.createElement('div');
+        err.id = 'booking-error';
+        err.className = 'error-message visible';
+        err.data-testid = 'booking-error';
+        err.textContent = 'Table is no longer available. Please try another.';
+        document.getElementById('booking-form-container').insertBefore(err, document.getElementById('booking-form-container').firstChild);
         await search();
       } else {
-        document.getElementById('booking-error').textContent = `Booking failed: ${result.data?.error?.code || 'Unknown error'}`;
-        document.getElementById('booking-error').style.display = 'block';
+        const err = document.createElement('div');
+        err.id = 'booking-error';
+        err.className = 'error-message visible';
+        err.data-testid = 'booking-error';
+        err.textContent = `Booking failed: ${result.data?.error?.code || 'Unknown error'}`;
+        document.getElementById('booking-form-container').insertBefore(err, document.getElementById('booking-form-container').firstChild);
       }
     } catch (e) {
-      // Network error - show uncertain state
-      document.getElementById('booking-uncertain').textContent = 'Unable to confirm your booking. Your reservation may have been created. Please try again.';
-      document.getElementById('booking-uncertain').style.display = 'block';
+      const uncEl = document.createElement('div');
+      uncEl.id = 'booking-uncertain';
+      uncEl.className = 'warning-message visible';
+      uncEl.data-testid = 'booking-uncertain';
+      uncEl.textContent = 'Unable to confirm your booking. Your reservation may have been created. Please try again.';
+      document.getElementById('booking-form-container').insertBefore(uncEl, document.getElementById('booking-form-container').firstChild);
     } finally {
       button.disabled = false;
     }
@@ -365,12 +418,18 @@ const app = (() => {
     const ref = document.getElementById('lookup-reference-input').value.trim().toUpperCase();
     if (!ref) return;
 
-    document.getElementById('lookup-error').style.display = 'none';
-    document.getElementById('reservation-detail').classList.remove('visible');
+    const errorEl = document.getElementById('lookup-error');
+    const detailEl = document.getElementById('reservation-detail');
+    if (errorEl) errorEl.remove();
+    if (detailEl) detailEl.remove();
 
     if (!state.token) {
-      document.getElementById('lookup-error').textContent = 'Please sign in to look up your booking.';
-      document.getElementById('lookup-error').classList.add('visible');
+      const err = document.createElement('div');
+      err.id = 'lookup-error';
+      err.className = 'reservation-error visible';
+      err.data-testid = 'reservation-error';
+      err.textContent = 'Please sign in to look up your booking.';
+      document.getElementById('page-lookup').appendChild(err);
       return;
     }
 
@@ -385,32 +444,58 @@ const app = (() => {
           return table?.label || tid;
         }).join(', ');
 
-        document.getElementById('detail-restaurant').textContent = restaurant.name;
-        document.getElementById('detail-tables').textContent = tables;
-        document.getElementById('detail-time').textContent = res.starts_at_local.split('T')[1];
-        document.getElementById('detail-party').textContent = res.party_size;
-
-        const statusEl = document.getElementById('detail-status');
-        statusEl.textContent = res.status;
-        statusEl.className = 'reservation-item-value ' + res.status;
-
-        const cancelBtn = document.getElementById('reservation-cancel-button');
-        cancelBtn.style.display = res.status === 'confirmed' ? 'block' : 'none';
-
-        document.getElementById('reservation-detail').classList.add('visible');
-        document.getElementById('reservation-detail').dataset.ref = ref;
+        const detail = document.createElement('div');
+        detail.id = 'reservation-detail';
+        detail.className = 'reservation-detail visible';
+        detail.data-testid = 'reservation-detail';
+        detail.dataset.ref = ref;
+        const cancelBtn = res.status === 'confirmed' ? `<button id="reservation-cancel-button" data-testid="reservation-cancel-button" class="btn-danger" onclick="app.cancelReservation()" style="margin-top: var(--spacing-lg);">Cancel reservation</button>` : '';
+        detail.innerHTML = `
+          <h2>Reservation details</h2>
+          <div class="reservation-item">
+            <span class="reservation-item-label">Restaurant</span>
+            <span id="detail-restaurant" class="reservation-item-value">${restaurant.name}</span>
+          </div>
+          <div class="reservation-item">
+            <span class="reservation-item-label">Tables</span>
+            <span id="detail-tables" data-testid="reservation-tables" class="reservation-item-value">${tables}</span>
+          </div>
+          <div class="reservation-item">
+            <span class="reservation-item-label">Time</span>
+            <span id="detail-time" class="reservation-item-value">${res.starts_at_local.split('T')[1]}</span>
+          </div>
+          <div class="reservation-item">
+            <span class="reservation-item-label">Party size</span>
+            <span id="detail-party" class="reservation-item-value">${res.party_size}</span>
+          </div>
+          <div class="reservation-item">
+            <span class="reservation-item-label">Status</span>
+            <span id="detail-status" data-testid="reservation-status" class="reservation-item-value ${res.status}">${res.status}</span>
+          </div>
+          ${cancelBtn}
+        `;
+        document.getElementById('page-lookup').appendChild(detail);
       } else {
-        document.getElementById('lookup-error').textContent = 'Booking not found.';
-        document.getElementById('lookup-error').classList.add('visible');
+        const err = document.createElement('div');
+        err.id = 'lookup-error';
+        err.className = 'reservation-error visible';
+        err.data-testid = 'reservation-error';
+        err.textContent = 'Booking not found.';
+        document.getElementById('page-lookup').appendChild(err);
       }
     } catch (e) {
-      document.getElementById('lookup-error').textContent = 'Error: ' + e.message;
-      document.getElementById('lookup-error').classList.add('visible');
+      const err = document.createElement('div');
+      err.id = 'lookup-error';
+      err.className = 'reservation-error visible';
+      err.data-testid = 'reservation-error';
+      err.textContent = 'Error: ' + e.message;
+      document.getElementById('page-lookup').appendChild(err);
     }
   };
 
   const cancelReservation = async () => {
-    const ref = document.getElementById('reservation-detail').dataset.ref;
+    const detail = document.getElementById('reservation-detail');
+    const ref = detail?.dataset.ref;
     if (!ref) return;
 
     const btn = document.getElementById('reservation-cancel-button');
@@ -423,19 +508,35 @@ const app = (() => {
         const statusEl = document.getElementById('detail-status');
         statusEl.textContent = 'cancelled';
         statusEl.className = 'reservation-item-value cancelled';
-        btn.style.display = 'none';
-        document.getElementById('lookup-error').textContent = '';
-        document.getElementById('lookup-error').classList.remove('visible');
+        btn.remove();
       } else if (result.status === 409) {
-        document.getElementById('lookup-error').textContent = 'Cannot cancel: booking is within the cancellation window.';
-        document.getElementById('lookup-error').classList.add('visible');
+        const errorEl = document.getElementById('lookup-error');
+        if (errorEl) errorEl.remove();
+        const err = document.createElement('div');
+        err.id = 'lookup-error';
+        err.className = 'reservation-error visible';
+        err.data-testid = 'reservation-error';
+        err.textContent = 'Cannot cancel: booking is within the cancellation window.';
+        document.getElementById('page-lookup').appendChild(err);
       } else {
-        document.getElementById('lookup-error').textContent = 'Cancellation failed.';
-        document.getElementById('lookup-error').classList.add('visible');
+        const errorEl = document.getElementById('lookup-error');
+        if (errorEl) errorEl.remove();
+        const err = document.createElement('div');
+        err.id = 'lookup-error';
+        err.className = 'reservation-error visible';
+        err.data-testid = 'reservation-error';
+        err.textContent = 'Cancellation failed.';
+        document.getElementById('page-lookup').appendChild(err);
       }
     } catch (e) {
-      document.getElementById('lookup-error').textContent = 'Error: ' + e.message;
-      document.getElementById('lookup-error').classList.add('visible');
+      const errorEl = document.getElementById('lookup-error');
+      if (errorEl) errorEl.remove();
+      const err = document.createElement('div');
+      err.id = 'lookup-error';
+      err.className = 'reservation-error visible';
+      err.data-testid = 'reservation-error';
+      err.textContent = 'Error: ' + e.message;
+      document.getElementById('page-lookup').appendChild(err);
     } finally {
       btn.disabled = false;
     }
@@ -448,7 +549,7 @@ const app = (() => {
     const password = document.getElementById('signup-password').value;
     const displayName = document.getElementById('signup-display-name').value;
 
-    document.getElementById('signup-auth-error').style.display = 'none';
+    hideError('signup-auth-error');
 
     try {
       const result = await API.signup(email, password, displayName);
@@ -460,12 +561,10 @@ const app = (() => {
         localStorage.setItem('displayName', state.displayName);
         router('/');
       } else {
-        document.getElementById('signup-auth-error').textContent = result.data?.error?.message || 'Signup failed';
-        document.getElementById('signup-auth-error').style.display = 'block';
+        showError('signup-auth-error', result.data?.error?.message || 'Signup failed');
       }
     } catch (e) {
-      document.getElementById('signup-error').textContent = 'Error: ' + e.message;
-      document.getElementById('signup-error').style.display = 'block';
+      showError('signup-auth-error', 'Error: ' + e.message);
     }
   };
 
@@ -475,7 +574,7 @@ const app = (() => {
     const email = document.getElementById('login-email').value;
     const password = document.getElementById('login-password').value;
 
-    document.getElementById('login-auth-error').style.display = 'none';
+    hideError('login-auth-error');
 
     try {
       const result = await API.login(email, password);
@@ -487,12 +586,10 @@ const app = (() => {
         localStorage.setItem('displayName', state.displayName);
         router('/');
       } else {
-        document.getElementById('login-auth-error').textContent = result.data?.error?.message || 'Login failed';
-        document.getElementById('login-auth-error').style.display = 'block';
+        showError('login-auth-error', result.data?.error?.message || 'Login failed');
       }
     } catch (e) {
-      document.getElementById('login-error').textContent = 'Error: ' + e.message;
-      document.getElementById('login-error').style.display = 'block';
+      showError('login-auth-error', 'Error: ' + e.message);
     }
   };
 
@@ -506,10 +603,8 @@ const app = (() => {
     return div.innerHTML;
   };
 
-  // Handle back/forward navigation
   window.addEventListener('popstate', render);
 
-  // Initial render
   render();
 
   return {
