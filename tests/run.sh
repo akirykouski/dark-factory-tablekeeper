@@ -34,6 +34,7 @@ trap cleanup EXIT
 
 if [ -z "${TK_BASE_URL:-}" ]; then
   read -r CID TK_BASE_URL < <(start "$ROOT/stage-$N" "tk-accept-stage-$N")
+  [ -n "${TK_BASE_URL:-}" ] || exit 1
   export TK_BASE_URL
 fi
 # Earlier stages' builds, for upgrade (export -> import) tests: TK_PREV_URL_<i>.
