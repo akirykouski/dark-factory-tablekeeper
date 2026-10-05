@@ -1,0 +1,16 @@
+{
+  "theme": "dark",
+  "autoMemoryEnabled": false,
+  "permissions": {
+    "deny": [
+      "Read(//Users/arseniy/hack/band_my/ref/pocketful/test/**)",
+      "Bash(*ref/pocketful/test*)",
+      "Read(//Users/arseniy/hack/band_my/ref/tablekeeper/test/**)",
+      "Bash(*ref/tablekeeper/test*)",
+      "Read(//Users/arseniy/hack/band_my/df-bench/**)",
+      "Bash(*df-bench*)",
+      "Read(//Users/arseniy/hack/band_my/factory/shadow/**)",
+      "Bash(*factory/shadow*)"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Per-seat launcher. Invoked as a copy named after the seat (bin/seat-architect, …):
+# every git operation the seat runs — commit, merge, revert — is authored as that seat.
+SEAT="${0##*/}"; SEAT="${SEAT#seat-}"
+# Seats keep no memory between runs: everything they know comes from their mandate.
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+export GIT_AUTHOR_NAME="$SEAT" GIT_COMMITTER_NAME="$SEAT"
+export GIT_AUTHOR_EMAIL="$SEAT@factory.local" GIT_COMMITTER_EMAIL="$SEAT@factory.local"
+exec "$(dirname "$0")/claude-seat" "$@"

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Launch Claude Code for a factory seat with a dedicated, clean config home, so no personal
+# CLAUDE.md, hooks, plugins or MCP servers leak into unattended seats.
+# Log in once: CLAUDE_CONFIG_DIR=<factory>/claude-home claude  →  /login  →  /exit
+# (The run in room.json used this launcher with the factory folder at an absolute path.)
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+export CLAUDE_CONFIG_DIR="${FACTORY_CLAUDE_HOME:-$HERE/claude-home}"
+if [ -z "${CLAUDE_BIN:-}" ]; then
+  CLAUDE_BIN="$(command -v claude || echo "$HOME/.local/bin/claude")"
+fi
+exec "$CLAUDE_BIN" "$@"
