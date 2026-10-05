@@ -47,7 +47,7 @@
           </div>
         </div>
 
-        <div id="search-error" data-testid="auth-error" class="error-message"></div>
+        <div id="search-auth-error" data-testid="auth-error" class="error-message"></div>
 
         <div class="grid-wrapper">
           <div id="no-slots" data-testid="no-slots" class="no-slots">No availability for this date</div>
@@ -86,7 +86,7 @@
       <div id="page-signup" style="display: none;">
         <div class="auth-container">
           <h1>Sign up</h1>
-          <div id="signup-error" data-testid="auth-error" class="error-message"></div>
+          <div id="signup-auth-error" data-testid="auth-error" class="error-message"></div>
 
           <form id="signup-form" onsubmit="app.submitSignup(event)">
             <div class="form-group">
@@ -111,7 +111,7 @@
       <div id="page-login" style="display: none;">
         <div class="auth-container">
           <h1>Sign in</h1>
-          <div id="login-error" data-testid="auth-error" class="error-message"></div>
+          <div id="login-auth-error" data-testid="auth-error" class="error-message"></div>
 
           <form id="login-form" onsubmit="app.submitLogin(event)">
             <div class="form-group">
@@ -133,9 +133,12 @@
         <h1>Find my booking</h1>
 
         <div class="lookup-container">
-          <div class="lookup-form">
-            <input type="text" id="lookup-reference-input" data-testid="lookup-reference-input" placeholder="Enter reference code" maxlength="12">
-            <button class="btn-primary" onclick="app.lookupReservation()" data-testid="lookup-submit">Look up</button>
+          <div class="form-group">
+            <label for="lookup-reference-input">Reservation reference</label>
+            <div class="lookup-form">
+              <input type="text" id="lookup-reference-input" data-testid="lookup-reference-input" placeholder="Enter reference code" maxlength="12">
+              <button class="btn-primary" onclick="app.lookupReservation()" data-testid="lookup-submit">Look up</button>
+            </div>
           </div>
 
           <div id="lookup-error" data-testid="reservation-error" class="reservation-error"></div>

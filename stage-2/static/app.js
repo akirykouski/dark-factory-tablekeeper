@@ -167,7 +167,7 @@ const app = (() => {
     const searchSeq = state.currentSearchSeq;
 
     try {
-      document.getElementById('search-error').style.display = 'none';
+      document.getElementById('search-auth-error').style.display = 'none';
       const availability = await API.getAvailability(restaurantId, date, partySize);
 
       // Ignore if a newer search has started
@@ -188,8 +188,8 @@ const app = (() => {
 
       renderGrid(restaurant, availability, partySize);
     } catch (e) {
-      document.getElementById('search-error').textContent = 'Search failed: ' + e.message;
-      document.getElementById('search-error').style.display = 'block';
+      document.getElementById('search-auth-error').textContent = 'Search failed: ' + e.message;
+      document.getElementById('search-auth-error').style.display = 'block';
     }
   };
 
@@ -223,8 +223,8 @@ const app = (() => {
         const cell = createGridCell(cellId, table.label || table.id, hhmm, isAvailable, () => {
           if (isAvailable) {
             if (!state.token) {
-              document.getElementById('search-error').textContent = 'Please sign in to book';
-              document.getElementById('search-error').style.display = 'block';
+              document.getElementById('search-auth-error').textContent = 'Please sign in to book';
+              document.getElementById('search-auth-error').style.display = 'block';
               return;
             }
             selectSlot([table.id], table.label || table.id, hhmm);
@@ -248,8 +248,8 @@ const app = (() => {
           const isAvailable = true; // It's in available_options, so it's available
           const cell = createGridCell(cellId, `${label1} + ${label2}`, hhmm, isAvailable, () => {
             if (!state.token) {
-              document.getElementById('search-error').textContent = 'Please sign in to book';
-              document.getElementById('search-error').style.display = 'block';
+              document.getElementById('search-auth-error').textContent = 'Please sign in to book';
+              document.getElementById('search-auth-error').style.display = 'block';
               return;
             }
             selectSlot(option.table_ids, `${label1} + ${label2}`, hhmm);
@@ -448,7 +448,7 @@ const app = (() => {
     const password = document.getElementById('signup-password').value;
     const displayName = document.getElementById('signup-display-name').value;
 
-    document.getElementById('signup-error').style.display = 'none';
+    document.getElementById('signup-auth-error').style.display = 'none';
 
     try {
       const result = await API.signup(email, password, displayName);
@@ -460,8 +460,8 @@ const app = (() => {
         localStorage.setItem('displayName', state.displayName);
         router('/');
       } else {
-        document.getElementById('signup-error').textContent = result.data?.error?.message || 'Signup failed';
-        document.getElementById('signup-error').style.display = 'block';
+        document.getElementById('signup-auth-error').textContent = result.data?.error?.message || 'Signup failed';
+        document.getElementById('signup-auth-error').style.display = 'block';
       }
     } catch (e) {
       document.getElementById('signup-error').textContent = 'Error: ' + e.message;
@@ -475,7 +475,7 @@ const app = (() => {
     const email = document.getElementById('login-email').value;
     const password = document.getElementById('login-password').value;
 
-    document.getElementById('login-error').style.display = 'none';
+    document.getElementById('login-auth-error').style.display = 'none';
 
     try {
       const result = await API.login(email, password);
@@ -487,8 +487,8 @@ const app = (() => {
         localStorage.setItem('displayName', state.displayName);
         router('/');
       } else {
-        document.getElementById('login-error').textContent = result.data?.error?.message || 'Login failed';
-        document.getElementById('login-error').style.display = 'block';
+        document.getElementById('login-auth-error').textContent = result.data?.error?.message || 'Login failed';
+        document.getElementById('login-auth-error').style.display = 'block';
       }
     } catch (e) {
       document.getElementById('login-error').textContent = 'Error: ' + e.message;

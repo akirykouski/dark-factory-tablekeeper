@@ -429,15 +429,17 @@ button {
 .lookup-form {
   display: flex;
   gap: var(--spacing-md);
-  margin-bottom: var(--spacing-lg);
 }
 
 .lookup-form input {
   flex: 1;
+  margin-bottom: 0;
 }
 
 .lookup-form button {
   flex: 0 0 auto;
+  margin-top: 0;
+  align-self: flex-end;
 }
 
 .reservation-detail {
