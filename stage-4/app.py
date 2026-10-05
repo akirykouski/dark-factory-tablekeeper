@@ -1398,6 +1398,9 @@ async def export(request: Request) -> JSONResponse:
                 "idempotency": idem,
                 "policies": state.policies,
                 "series": list(state.series.values()),
+                "closures": {f"{rid}:{tid}": [(s.isoformat(), e.isoformat()) for s, e in intervals] for (rid, tid), intervals in state.closures.items()},
+                "replans": list(state.replans.values()),
+                "restaurant_revisions": dict(state.restaurant_revisions),
             },
         }
         export_data = copy.deepcopy(export_data)
@@ -1561,9 +1564,33 @@ def build_import_state(st) -> Optional[dict]:
         return None
     except Exception:
         return None
+
+    # Load closures
+    closures = {}
+    for key_str, intervals in st.get("closures", {}).items():
+        if ":" not in key_str:
+            continue
+        rid, tid = key_str.split(":", 1)
+        for s_str, e_str in intervals:
+            try:
+                s = parse_rfc3339(s_str) if "T" in s_str else datetime.fromisoformat(s_str).replace(tzinfo=timezone.utc)
+                e = parse_rfc3339(e_str) if "T" in e_str else datetime.fromisoformat(e_str).replace(tzinfo=timezone.utc)
+                closures.setdefault((rid, tid), []).append((s, e))
+            except:
+                pass
+
+    # Load replans
+    replans = {p.get("plan_id"): p for p in st.get("replans", []) if isinstance(p, dict) and "plan_id" in p}
+
+    # Load restaurant revisions (default to 0 if missing)
+    restaurant_revisions = {}
+    for rid in restaurants.keys():
+        restaurant_revisions[rid] = st.get("restaurant_revisions", {}).get(rid, 0)
+
     return {"users": users, "tokens": dict(st["tokens"]), "restaurants": restaurants,
             "reservations": reservations, "idempotency": idem, "occupancy": occupancy,
-            "policies": policies, "series": series_objs}
+            "policies": policies, "series": series_objs, "closures": closures,
+            "replans": replans, "restaurant_revisions": restaurant_revisions}
 
 
 async def import_(request: Request) -> Response:
@@ -1595,6 +1622,9 @@ async def import_(request: Request) -> Response:
         state.occupancy = built["occupancy"]
         state.policies = built["policies"]
         state.series = built["series"]
+        state.closures = built["closures"]
+        state.replans = built["replans"]
+        state.restaurant_revisions = built["restaurant_revisions"]
 
     return Response(status_code=204)
 
